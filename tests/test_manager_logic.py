@@ -800,6 +800,12 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('let lastNodesSnapshotSignature = "";', manager.INDEX_HTML)
         self.assertIn("if (signature === lastNodesSnapshotSignature) return false;", manager.INDEX_HTML)
         self.assertIn('typeof document.hidden !== "boolean" || !document.hidden', manager.INDEX_HTML)
+        self.assertIn("connectionPollDeadline", manager.INDEX_HTML)
+        self.assertIn("confirmConnectionAfterTransportReset", manager.INDEX_HTML)
+        self.assertIn(
+            "state.active_openvpn_node_id === id && Boolean(state.proxy_ready)",
+            manager.INDEX_HTML,
+        )
         self.assertEqual(500, manager.WEB_LOG_MAX_ENTRIES)
 
     def test_web_dashboard_has_cross_browser_interaction_safeguards(self) -> None:
