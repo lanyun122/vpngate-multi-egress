@@ -19,6 +19,79 @@ def parse_positive_int(value: str | None, default: int) -> int:
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
 
+_proxy_sessions_lock = threading.Lock()
+_proxy_sessions: dict[int, tuple[int, socket.socket]] = {}
+_proxy_session_generation = 0
+_proxy_session_sequence = 0
+
+def _register_proxy_session(client: socket.socket) -> int:
+    """Register an accepted client before its worker starts."""
+    global _proxy_session_sequence
+    with _proxy_sessions_lock:
+        _proxy_session_sequence += 1
+        session_id = _proxy_session_sequence
+        _proxy_sessions[session_id] = (_proxy_session_generation, client)
+        return session_id
+
+def _unregister_proxy_session(session_id: int) -> None:
+    with _proxy_sessions_lock:
+        _proxy_sessions.pop(session_id, None)
+
+def active_proxy_session_count() -> int:
+    with _proxy_sessions_lock:
+        return len(_proxy_sessions)
+
+def reset_active_proxy_sessions(reason: str = "", delay_seconds: float = 1.0) -> int:
+    """Close sessions from the previous tunnel generation.
+
+    The generation advances immediately, so clients that reconnect while the
+    delayed reset is pending are not closed with the stale sessions.
+    """
+    global _proxy_session_generation
+    with _proxy_sessions_lock:
+        stale_generation = _proxy_session_generation
+        _proxy_session_generation += 1
+        stale_sessions = [
+            (session_id, client)
+            for session_id, (generation, client) in _proxy_sessions.items()
+            if generation <= stale_generation
+        ]
+        for session_id, _ in stale_sessions:
+            _proxy_sessions.pop(session_id, None)
+
+    if not stale_sessions:
+        return 0
+
+    delay = max(0.0, float(delay_seconds))
+
+    def close_stale_sessions() -> None:
+        if delay:
+            time.sleep(delay)
+        for _, client in stale_sessions:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except (AttributeError, OSError):
+                pass
+            try:
+                client.close()
+            except (AttributeError, OSError):
+                pass
+        reason_suffix = f" ({reason})" if reason else ""
+        print(
+            f"[代理会话刷新] 已关闭 {len(stale_sessions)} 个旧隧道会话{reason_suffix}",
+            flush=True,
+        )
+
+    if delay:
+        threading.Thread(
+            target=close_stale_sessions,
+            name="proxy-session-reset",
+            daemon=True,
+        ).start()
+    else:
+        close_stale_sessions()
+    return len(stale_sessions)
+
 def parse_int(value: Any) -> int:
     try:
         return int(value)
@@ -462,13 +535,29 @@ def start_proxy_server(host: str, port: int) -> None:
                     pass
                 continue
 
-            def run_client(client_socket: socket.socket = client, client_address: tuple[str, int] = address) -> None:
+            session_id = _register_proxy_session(client)
+
+            def run_client(
+                client_socket: socket.socket = client,
+                client_address: tuple[str, int] = address,
+                registered_session_id: int = session_id,
+            ) -> None:
                 try:
                     proxy_client(client_socket, client_address)
                 finally:
+                    _unregister_proxy_session(registered_session_id)
                     proxy_connection_sem.release()
 
-            threading.Thread(target=run_client, daemon=True).start()
+            try:
+                threading.Thread(target=run_client, daemon=True).start()
+            except Exception:
+                _unregister_proxy_session(session_id)
+                proxy_connection_sem.release()
+                try:
+                    client.close()
+                except OSError:
+                    pass
+                raise
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)
