@@ -5462,6 +5462,7 @@ async function connectNode(id){
         clearInterval(pollInterval);
         pollInterval = null;
       }
+      connectionPollDeadline = 0;
       state.is_connecting = false;
       state.pending_node_id = "";
       await load();
