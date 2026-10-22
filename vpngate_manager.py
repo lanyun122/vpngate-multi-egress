@@ -2383,6 +2383,16 @@ def connect_node(node_id: str) -> str:
                 proxy_error="",
             )
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+        stale_session_count = proxy_server.reset_active_proxy_sessions(
+            reason=f"VPN 节点已切换至 {node_id}",
+            delay_seconds=1.0,
+        )
+        if stale_session_count:
+            log_to_json(
+                "INFO",
+                "Proxy",
+                f"已安排刷新 {stale_session_count} 个旧代理会话，客户端将自动重连",
+            )
         cancel_background_refill()
         return f"Connected {node_id}"
     except ConnectionCancelled:
