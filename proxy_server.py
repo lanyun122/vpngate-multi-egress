@@ -83,11 +83,16 @@ def reset_active_proxy_sessions(reason: str = "", delay_seconds: float = 1.0) ->
         )
 
     if delay:
-        threading.Thread(
-            target=close_stale_sessions,
-            name="proxy-session-reset",
-            daemon=True,
-        ).start()
+        try:
+            threading.Thread(
+                target=close_stale_sessions,
+                name="proxy-session-reset",
+                daemon=True,
+            ).start()
+        except Exception:
+            # A reset must not turn an otherwise successful VPN switch into
+            # a failure if the helper thread cannot be created.
+            close_stale_sessions()
     else:
         close_stale_sessions()
     return len(stale_sessions)
