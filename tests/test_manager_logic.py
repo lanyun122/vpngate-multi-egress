@@ -1136,6 +1136,42 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
                 proxy_server._unregister_proxy_session(new_session_id)
             proxy_server.reset_active_proxy_sessions(delay_seconds=0)
 
+    def test_session_reset_falls_back_if_worker_thread_cannot_start(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def shutdown(self, how) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        class BrokenThread:
+            def __init__(self, target, name=None, daemon=True):
+                self.target = target
+
+            def start(self):
+                raise RuntimeError("thread unavailable")
+
+        proxy_server.reset_active_proxy_sessions(delay_seconds=0)
+        client = Client()
+        session_id = proxy_server._register_proxy_session(client)
+        try:
+            with (
+                mock.patch.object(proxy_server.threading, "Thread", BrokenThread),
+                mock.patch.object(proxy_server.time, "sleep") as sleep_mock,
+            ):
+                reset_count = proxy_server.reset_active_proxy_sessions(delay_seconds=1.0)
+
+            self.assertEqual(1, reset_count)
+            sleep_mock.assert_called_once_with(1.0)
+            self.assertTrue(client.closed)
+            self.assertEqual(0, proxy_server.active_proxy_session_count())
+        finally:
+            proxy_server._unregister_proxy_session(session_id)
+            proxy_server.reset_active_proxy_sessions(delay_seconds=0)
+
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
         class Client:
             def __init__(self):
