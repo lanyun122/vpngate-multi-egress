@@ -5315,6 +5315,7 @@ let pollInterval = null;
 let refreshPollInterval = null;
 let refreshPollInFlight = false;
 let connectionPollInFlight = false;
+let connectionPollDeadline = 0;
 let nodesRequestPromise = null;
 
 async function fetchNodesSnapshot() {
@@ -5388,6 +5389,7 @@ function startRefreshPolling() {
 
 function startConnectionPolling() {
   if (pollInterval) clearInterval(pollInterval);
+  connectionPollDeadline = Date.now() + 195000;
   pollInterval = setInterval(async () => {
     if (connectionPollInFlight || !isPageVisible()) return;
     connectionPollInFlight = true;
@@ -5398,19 +5400,42 @@ function startConnectionPolling() {
       if (!state.is_connecting && !state.maintenance_running) {
         clearInterval(pollInterval);
         pollInterval = null;
+        connectionPollDeadline = 0;
         try {
           await fetchWithTimeout("./api/test_proxy", { method: "POST" }, 45000);
         } catch(pe){}
         load();
       }
     } catch(pe) {
-      clearInterval(pollInterval);
-      pollInterval = null;
-      load();
+      // The management request can briefly lose its old proxy tunnel while
+      // the node is switching. Keep polling so the UI recovers by itself.
+      if (Date.now() >= connectionPollDeadline) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        connectionPollDeadline = 0;
+        load();
+      }
     } finally {
       connectionPollInFlight = false;
     }
   }, 1000);
+}
+
+async function confirmConnectionAfterTransportReset(id, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const data = await fetchNodesSnapshot();
+      applyNodesSnapshot(data);
+      if (!state.is_connecting && !state.maintenance_running) {
+        return state.active_openvpn_node_id === id && Boolean(state.proxy_ready);
+      }
+    } catch (e) {
+      // Expected while the old tunnel-bound management connection is reset.
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  return false;
 }
 
 async function connectNode(id){
@@ -5443,11 +5468,26 @@ async function connectNode(id){
       return;
     }
   } catch(e) {
-    alert("连接请求错误: " + (e.message || "未知错误"));
     if (pollInterval) {
       clearInterval(pollInterval);
       pollInterval = null;
     }
+    connectionPollDeadline = 0;
+
+    // Scheme A intentionally closes the old proxy session after a successful
+    // switch. Reconcile server state before treating that transport reset as
+    // a failed node switch.
+    const switched = await confirmConnectionAfterTransportReset(id);
+    if (switched) {
+      try {
+        await load();
+      } catch (loadError) {
+        render();
+      }
+      return;
+    }
+
+    alert("连接请求错误: " + (e.message || "未知错误"));
     state.is_connecting = false;
     state.pending_node_id = "";
     try {
