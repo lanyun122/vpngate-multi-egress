@@ -2195,7 +2195,32 @@ def recover_after_manual_connect_failure(previous_node_id: str) -> None:
     if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
         auto_switch_node()
 
-def connect_node(node_id: str) -> str:
+def run_manual_connect_job(
+    node_id: str,
+    previous_node_id: str,
+    token: int,
+    cancel_event: threading.Event,
+    response_sent: threading.Event,
+) -> None:
+    """Finish a UI-requested switch after the HTTP 202 response is on the wire."""
+    response_sent.wait()
+    # Give the acknowledgement a short head start through the old tunnel.
+    time.sleep(1.0)
+    try:
+        connect_node(node_id, reserved_attempt=(token, cancel_event))
+    except ConnectionCancelled as exc:
+        log_to_json("WARNING", "VPN", f"手动切换已取消: {exc}")
+    except Exception as exc:
+        log_to_json("ERROR", "VPN", f"手动切换节点 {node_id} 失败: {exc}")
+        try:
+            recover_after_manual_connect_failure(previous_node_id)
+        except Exception as recovery_exc:
+            log_to_json("ERROR", "VPN", f"手动切换失败后的恢复任务异常: {recovery_exc}")
+
+def connect_node(
+    node_id: str,
+    reserved_attempt: tuple[int, threading.Event] | None = None,
+) -> str:
     global active_openvpn_process, active_openvpn_node_id
     global last_active_ping_time, last_active_latency
     global consecutive_proxy_failures, last_proxy_failure_node_id
@@ -2203,10 +2228,15 @@ def connect_node(node_id: str) -> str:
     if not node_id:
         raise ValueError("Node id is required")
 
-    token, cancel_event = begin_connection_attempt()
+    if reserved_attempt is None:
+        token, cancel_event = begin_connection_attempt()
+    else:
+        token, cancel_event = reserved_attempt
     stopped_existing = False
     previous_node_id = ""
     try:
+        if not connection_attempt_is_current(token, cancel_event):
+            raise ConnectionCancelled("连接操作已取消")
         set_state(
             is_connecting=True,
             pending_node_id=node_id,
@@ -2243,46 +2273,17 @@ def connect_node(node_id: str) -> str:
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
-        probed_at = float(node.get("probed_at", 0) or 0)
-        should_preflight = (
-            SWITCH_PREFLIGHT_MAX_AGE_SECONDS > 0
-            and bool(previous_node_id)
-            and previous_node_id != node_id
-            and time.time() - probed_at > SWITCH_PREFLIGHT_MAX_AGE_SECONDS
-        )
-        if should_preflight:
-            set_state(active_node_latency="切换预检", last_check_message="正在保持当前连接并预检目标节点...")
-            test_index = None
-            try:
-                test_index = get_free_test_index()
-                preflight_ok, preflight_message, _ = run_openvpn_until_ready(
-                    str(config_path),
-                    keep_alive=False,
-                    route_nopull=True,
-                    timeout=12,
-                    dev=f"tun{test_index}",
-                    cancel_event=cancel_event,
-                    track_pending=True,
-                )
-            finally:
-                if test_index is not None:
-                    release_test_index(test_index)
-            if not connection_attempt_is_current(token, cancel_event):
-                raise ConnectionCancelled("连接操作已取消")
-            if not preflight_ok:
-                with lock:
-                    current_nodes = read_nodes()
-                    failed_node = next((item for item in current_nodes if item.get("id") == node_id), None)
-                    if failed_node:
-                        failed_node["probe_status"] = "unavailable"
-                        failed_node["probe_message"] = preflight_message
-                        failed_node["probed_at"] = time.time()
-                        write_json(NODES_FILE, sort_all_nodes(current_nodes))
-                raise RuntimeError(f"目标节点预检失败，已保留当前连接: {preflight_message}")
-
+        # A manual switch now performs one real OpenVPN connection attempt.
+        # The previous implementation connected once for preflight, closed it,
+        # and immediately connected again. Some public VPNGate servers reject
+        # that rapid duplicate handshake even though a disconnect-then-connect
+        # operation succeeds.
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
-        set_state(active_node_latency="清理连接", last_check_message="目标节点可用，正在关闭旧的 VPN 连接及网卡...")
+        set_state(
+            active_node_latency="清理连接",
+            last_check_message="正在关闭旧的 VPN 连接，并自动切换到目标节点...",
+        )
         stop_active_openvpn()
         stopped_existing = True
 
@@ -5450,7 +5451,7 @@ async function connectNode(id){
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({id})
-    }, 180000);
+    }, 10000);
     startConnectionPolling();
     const r = await request;
     const result = await readJsonResponse(r, "连接请求失败");
@@ -5478,7 +5479,7 @@ async function connectNode(id){
     // Scheme A intentionally closes the old proxy session after a successful
     // switch. Reconcile server state before treating that transport reset as
     // a failed node switch.
-    const switched = await confirmConnectionAfterTransportReset(id);
+    const switched = await confirmConnectionAfterTransportReset(id, 195000);
     if (switched) {
       try {
         await load();
@@ -7210,28 +7211,69 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/connect":
-            previous_node_id = active_openvpn_node_id if active_openvpn_running() else ""
             try:
                 payload = self.read_json_body()
-                self.send_json({"ok": True, "message": connect_node(str(payload.get("id") or ""))})
-            except ConnectionCancelled as exc:
-                self.send_json({"ok": False, "cancelled": True, "error": str(exc)}, HTTPStatus.CONFLICT)
-            except RuntimeError as exc:
-                if str(exc).startswith("当前已有"):
-                    self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.CONFLICT)
+                node_id = str(payload.get("id") or "").strip()
+                if not node_id:
+                    self.send_json({"ok": False, "error": "节点 ID 不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
-                threading.Thread(
-                    target=recover_after_manual_connect_failure,
-                    args=(previous_node_id,),
-                    daemon=True,
-                ).start()
-                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                if not any(str(item.get("id") or "") == node_id for item in read_nodes()):
+                    self.send_json({"ok": False, "error": "节点不存在或已失效"}, HTTPStatus.NOT_FOUND)
+                    return
+
+                token, cancel_event = begin_connection_attempt()
+                try:
+                    with lock:
+                        previous_node_id = active_openvpn_node_id if active_openvpn_running() else ""
+
+                    response_sent = threading.Event()
+                    worker = threading.Thread(
+                        target=run_manual_connect_job,
+                        args=(node_id, previous_node_id, token, cancel_event, response_sent),
+                        name="manual-vpn-switch",
+                        daemon=True,
+                    )
+                    set_state(
+                        is_connecting=True,
+                        pending_node_id=node_id,
+                        active_node_latency="已受理",
+                        last_check_message="切换请求已接收，后台正在准备连接...",
+                    )
+                    worker.start()
+                except Exception:
+                    finish_connection_attempt(token, cancel_event)
+                    set_state(
+                        is_connecting=False,
+                        pending_node_id="",
+                        last_check_message="无法启动后台切换任务",
+                    )
+                    raise
+
+                try:
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "accepted": True,
+                            "id": node_id,
+                            "message": "切换请求已受理，请通过节点状态查看进度",
+                        },
+                        HTTPStatus.ACCEPTED,
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                    # The switch is already accepted. Losing the browser socket
+                    # must not be treated as a VPN connection failure.
+                    log_to_json("WARNING", "Web", f"切换受理响应发送中断，后台任务继续执行: {exc}")
+                finally:
+                    response_sent.set()
+            except RuntimeError as exc:
+                status = (
+                    HTTPStatus.CONFLICT
+                    if str(exc).startswith("当前已有")
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                self.send_json({"ok": False, "error": str(exc)}, status)
             except Exception as exc:
-                threading.Thread(
-                    target=recover_after_manual_connect_failure,
-                    args=(previous_node_id,),
-                    daemon=True,
-                ).start()
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/test_node":
             try:
