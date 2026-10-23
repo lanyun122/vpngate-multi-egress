@@ -569,11 +569,12 @@ class ManagerLogicTests(unittest.TestCase):
         manager.reset_proxy_failure_counter("node-b")
         self.assertEqual(1, manager.record_proxy_failure("node-b"))
 
-    def test_failed_switch_preflight_keeps_current_connection(self) -> None:
+    def test_direct_switch_attempts_target_only_once(self) -> None:
         nodes = self.write_nodes(2)
         nodes[0]["active"] = True
         manager.write_json(manager.NODES_FILE, nodes)
         current_process = FakeProcess()
+        target_process = FakeProcess()
         manager.active_openvpn_process = current_process
         manager.active_openvpn_node_id = nodes[0]["id"]
 
@@ -581,18 +582,56 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(
                 manager,
                 "run_openvpn_until_ready",
-                return_value=(False, "preflight failed", None),
+                return_value=(True, "ready", target_process),
+            ) as openvpn_mock,
+            mock.patch.object(manager, "setup_policy_routing", return_value=True),
+            mock.patch.object(manager, "cleanup_policy_routing"),
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(
+                manager,
+                "check_proxy_health",
+                return_value={"ok": True, "ip": "198.51.100.91", "latency_ms": 12},
             ),
+            mock.patch.object(manager.proxy_server, "reset_active_proxy_sessions", return_value=0),
             mock.patch.object(manager, "log_to_json"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "已保留当前连接"):
-                manager.connect_node(nodes[1]["id"])
+            manager.connect_node(nodes[1]["id"])
 
-        self.assertIs(manager.active_openvpn_process, current_process)
-        self.assertEqual(nodes[0]["id"], manager.active_openvpn_node_id)
-        self.assertTrue(current_process.running)
-        stored = {node["id"]: node for node in manager.read_nodes()}
-        self.assertEqual("unavailable", stored[nodes[1]["id"]]["probe_status"])
+        self.assertEqual(1, openvpn_mock.call_count)
+        self.assertFalse(current_process.running)
+        self.assertIs(manager.active_openvpn_process, target_process)
+        self.assertEqual(nodes[1]["id"], manager.active_openvpn_node_id)
+
+    def test_manual_connect_job_waits_for_ack_before_switch(self) -> None:
+        order = []
+
+        class ResponseGate:
+            def wait(self) -> None:
+                order.append("ack")
+
+        with (
+            mock.patch.object(manager.time, "sleep", side_effect=lambda _: order.append("grace")),
+            mock.patch.object(
+                manager,
+                "connect_node",
+                side_effect=lambda node_id, reserved_attempt=None: order.append(
+                    ("connect", node_id, reserved_attempt)
+                ),
+            ),
+        ):
+            cancel_event = threading.Event()
+            manager.run_manual_connect_job(
+                "node-1",
+                "node-0",
+                7,
+                cancel_event,
+                ResponseGate(),
+            )
+
+        self.assertEqual(
+            ["ack", "grace", ("connect", "node-1", (7, cancel_event))],
+            order,
+        )
 
     def test_proxy_failure_does_not_report_connection_success(self) -> None:
         nodes = self.write_nodes(1)
@@ -802,6 +841,8 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('typeof document.hidden !== "boolean" || !document.hidden', manager.INDEX_HTML)
         self.assertIn("connectionPollDeadline", manager.INDEX_HTML)
         self.assertIn("confirmConnectionAfterTransportReset", manager.INDEX_HTML)
+        self.assertIn("confirmConnectionAfterTransportReset(id, 195000)", manager.INDEX_HTML)
+        self.assertNotIn("}, 180000);", manager.INDEX_HTML)
         self.assertIn(
             "state.active_openvpn_node_id === id && Boolean(state.proxy_ready)",
             manager.INDEX_HTML,
