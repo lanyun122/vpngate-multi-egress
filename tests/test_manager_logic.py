@@ -619,6 +619,39 @@ class ManagerLogicTests(unittest.TestCase):
         stored = manager.read_nodes()
         self.assertEqual("unavailable", stored[0]["probe_status"])
 
+    def test_successful_connection_schedules_stale_proxy_session_reset(self) -> None:
+        nodes = self.write_nodes(1)
+        process = FakeProcess()
+
+        with (
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(True, "ready", process),
+            ),
+            mock.patch.object(manager, "setup_policy_routing", return_value=True),
+            mock.patch.object(manager, "cleanup_policy_routing"),
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(
+                manager,
+                "check_proxy_health",
+                return_value={"ok": True, "ip": "198.51.100.90", "latency_ms": 12},
+            ),
+            mock.patch.object(manager, "log_to_json"),
+            mock.patch.object(
+                manager.proxy_server,
+                "reset_active_proxy_sessions",
+                return_value=2,
+            ) as reset_mock,
+        ):
+            result = manager.connect_node(nodes[0]["id"])
+
+        self.assertEqual(f"Connected {nodes[0]['id']}", result)
+        reset_mock.assert_called_once_with(
+            reason=f"VPN 节点已切换至 {nodes[0]['id']}",
+            delay_seconds=1.0,
+        )
+
     def test_manual_failure_recovery_prefers_previous_node(self) -> None:
         with (
             mock.patch.object(manager, "active_openvpn_running", return_value=False),
@@ -767,6 +800,12 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('let lastNodesSnapshotSignature = "";', manager.INDEX_HTML)
         self.assertIn("if (signature === lastNodesSnapshotSignature) return false;", manager.INDEX_HTML)
         self.assertIn('typeof document.hidden !== "boolean" || !document.hidden', manager.INDEX_HTML)
+        self.assertIn("connectionPollDeadline", manager.INDEX_HTML)
+        self.assertIn("confirmConnectionAfterTransportReset", manager.INDEX_HTML)
+        self.assertIn(
+            "state.active_openvpn_node_id === id && Boolean(state.proxy_ready)",
+            manager.INDEX_HTML,
+        )
         self.assertEqual(500, manager.WEB_LOG_MAX_ENTRIES)
 
     def test_web_dashboard_has_cross_browser_interaction_safeguards(self) -> None:
@@ -1045,6 +1084,94 @@ class ManagerLogicTests(unittest.TestCase):
 
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
+    def test_session_reset_closes_only_the_previous_generation(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+                self.closed = False
+
+            def shutdown(self, how) -> None:
+                self.shutdown_calls += 1
+
+            def close(self) -> None:
+                self.closed = True
+
+        class DeferredThread:
+            targets = []
+
+            def __init__(self, target, name=None, daemon=True):
+                self.target = target
+                self.targets.append(target)
+
+            def start(self):
+                pass
+
+        proxy_server.reset_active_proxy_sessions(delay_seconds=0)
+        old_client = Client()
+        new_client = Client()
+        old_session_id = proxy_server._register_proxy_session(old_client)
+
+        try:
+            with (
+                mock.patch.object(proxy_server.threading, "Thread", DeferredThread),
+                mock.patch.object(proxy_server.time, "sleep") as sleep_mock,
+            ):
+                reset_count = proxy_server.reset_active_proxy_sessions(
+                    reason="test switch",
+                    delay_seconds=1.0,
+                )
+                new_session_id = proxy_server._register_proxy_session(new_client)
+                self.assertEqual(1, reset_count)
+                self.assertEqual(1, proxy_server.active_proxy_session_count())
+                DeferredThread.targets[-1]()
+
+            sleep_mock.assert_called_once_with(1.0)
+            self.assertTrue(old_client.closed)
+            self.assertEqual(1, old_client.shutdown_calls)
+            self.assertFalse(new_client.closed)
+            self.assertEqual(0, new_client.shutdown_calls)
+        finally:
+            proxy_server._unregister_proxy_session(old_session_id)
+            if "new_session_id" in locals():
+                proxy_server._unregister_proxy_session(new_session_id)
+            proxy_server.reset_active_proxy_sessions(delay_seconds=0)
+
+    def test_session_reset_falls_back_if_worker_thread_cannot_start(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def shutdown(self, how) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        class BrokenThread:
+            def __init__(self, target, name=None, daemon=True):
+                self.target = target
+
+            def start(self):
+                raise RuntimeError("thread unavailable")
+
+        proxy_server.reset_active_proxy_sessions(delay_seconds=0)
+        client = Client()
+        session_id = proxy_server._register_proxy_session(client)
+        try:
+            with (
+                mock.patch.object(proxy_server.threading, "Thread", BrokenThread),
+                mock.patch.object(proxy_server.time, "sleep") as sleep_mock,
+            ):
+                reset_count = proxy_server.reset_active_proxy_sessions(delay_seconds=1.0)
+
+            self.assertEqual(1, reset_count)
+            sleep_mock.assert_called_once_with(1.0)
+            self.assertTrue(client.closed)
+            self.assertEqual(0, proxy_server.active_proxy_session_count())
+        finally:
+            proxy_server._unregister_proxy_session(session_id)
+            proxy_server.reset_active_proxy_sessions(delay_seconds=0)
+
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
         class Client:
             def __init__(self):
@@ -1125,6 +1252,7 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
                 target()
 
         self.assertEqual([("first", "first"), ("second", "second")], seen)
+        self.assertEqual(0, proxy_server.active_proxy_session_count())
 
 
 if __name__ == "__main__":
