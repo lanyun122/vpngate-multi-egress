@@ -141,7 +141,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "2.1.5"
+DEFAULT_APP_VERSION = "2.1.7"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -3451,6 +3451,105 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
     }
 
+    .batch-test-control {
+      flex: 1 1 300px;
+      min-width: 280px;
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 4px 9px 4px 4px;
+      border: 1px solid rgba(99, 102, 241, 0.42);
+      border-radius: 10px;
+      background: linear-gradient(90deg, rgba(99, 102, 241, 0.14), rgba(16, 185, 129, 0.06));
+      box-shadow: inset 0 0 18px rgba(99, 102, 241, 0.04);
+    }
+
+    .batch-test-button {
+      min-width: 138px;
+      height: 34px;
+      border: 0;
+      border-radius: 8px;
+      padding: 0 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      color: #fff;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+      background: linear-gradient(135deg, #6366f1, #4f46e5);
+      box-shadow: 0 6px 16px rgba(79, 70, 229, 0.26);
+      transition: transform 0.2s ease, opacity 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .batch-test-button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 20px rgba(79, 70, 229, 0.34);
+    }
+
+    .batch-test-button.is-running {
+      background: linear-gradient(135deg, #0ea5e9, #6366f1);
+    }
+
+    .batch-test-button.is-stopping {
+      background: linear-gradient(135deg, #f59e0b, #d97706);
+      cursor: wait;
+    }
+
+    .batch-test-button:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .batch-test-brand {
+      padding: 2px 5px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.18);
+      border: 1px solid rgba(255, 255, 255, 0.24);
+      font-size: 9px;
+      line-height: 1;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+
+    .batch-test-progress {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .batch-test-status {
+      color: var(--text-secondary);
+      font-size: 11px;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .batch-test-track {
+      width: 100%;
+      height: 3px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.18);
+    }
+
+    .batch-test-fill {
+      display: block;
+      width: 0;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #6366f1, #22c55e);
+      transition: width 0.25s ease;
+    }
+
     .toolbar select {
       width: 180px;
       height: 42px;
@@ -3928,6 +4027,19 @@ INDEX_HTML = r"""<!doctype html>
       .toolbar > input {
         font-size: 16px;
       }
+      .batch-test-control {
+        flex: 1 1 100%;
+        width: 100%;
+        min-width: 0;
+        min-height: 50px;
+      }
+      .batch-test-button {
+        min-width: 132px;
+      }
+      #btn_favorites {
+        margin-left: 0 !important;
+        flex: 1 1 100%;
+      }
     }
     
     /* Admin dropdown styles */
@@ -4178,12 +4290,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V2.1.5 正式版</span>
+        <span id="github_version_label">V2.1.7 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V2.1.5 正式版</div>
+          <div id="current_version_label" class="version-current-label">V2.1.7 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -4275,6 +4387,17 @@ INDEX_HTML = r"""<!doctype html>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
+    <div id="batch_test_control" class="batch-test-control">
+      <button id="btn_batch_test" class="batch-test-button" type="button" onclick="toggleBatchTest()" title="检测当前筛选结果，不会切换当前连接">
+        <span aria-hidden="true">⚡</span>
+        <span id="batch_test_label">一键检测</span>
+        <span class="batch-test-brand">优化版</span>
+      </button>
+      <div class="batch-test-progress" aria-live="polite">
+        <span id="batch_test_status" class="batch-test-status">检测当前筛选结果</span>
+        <span class="batch-test-track"><span id="batch_test_fill" class="batch-test-fill"></span></span>
+      </div>
+    </div>
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
@@ -4625,6 +4748,18 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 const favoriteRequestIds = new Set();
+const batchTestQueuedIds = new Set();
+const BATCH_TEST_SIZE = 5;
+const batchTest = {
+  running: false,
+  cancelRequested: false,
+  total: 0,
+  completed: 0,
+  available: 0,
+  unavailable: 0,
+  outcome: ""
+};
+let batchTestResetTimer = null;
 let disconnectInFlight = false;
 let currentPage = 1;
 const pageSize = 50;
@@ -5009,14 +5144,64 @@ function stableSortNodes() {
   });
 }
 
+function getBatchTestCandidates() {
+  const activeId = String(state.active_openvpn_node_id || "");
+  const pendingId = String(state.pending_node_id || "");
+  const seen = new Set();
+  return getFilteredNodes().filter(n => {
+    const id = String((n && n.id) || "");
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return !n.active &&
+      id !== activeId &&
+      id !== pendingId &&
+      n.probe_status !== "testing" &&
+      !testingNodeIds.has(id);
+  });
+}
+
+function renderBatchTestButton() {
+  const button = $("btn_batch_test");
+  const label = $("batch_test_label");
+  const status = $("batch_test_status");
+  const fill = $("batch_test_fill");
+  if (!button || !label || !status || !fill) return;
+
+  const progress = batchTest.total > 0
+    ? Math.min(100, Math.round((batchTest.completed / batchTest.total) * 100))
+    : 0;
+  fill.style.width = progress + "%";
+  button.classList.toggle("is-running", batchTest.running && !batchTest.cancelRequested);
+  button.classList.toggle("is-stopping", batchTest.running && batchTest.cancelRequested);
+
+  if (batchTest.running) {
+    button.disabled = false;
+    label.textContent = batchTest.cancelRequested ? "正在停止" : "停止检测";
+    status.textContent = batchTest.cancelRequested
+      ? `当前批次完成后停止 · ${batchTest.completed}/${batchTest.total}`
+      : `检测中 ${batchTest.completed}/${batchTest.total} · 可用 ${batchTest.available} · 不可用 ${batchTest.unavailable}`;
+    button.title = batchTest.cancelRequested ? "正在等待当前批次完成" : "点击可在当前批次完成后停止";
+    return;
+  }
+
+  const temporarilyBusy = Boolean(state.is_connecting || state.maintenance_running || testingNodeIds.size);
+  button.disabled = temporarilyBusy;
+  label.textContent = "一键检测";
+  status.textContent = batchTest.outcome || `检测当前筛选结果（${getBatchTestCandidates().length} 个）`;
+  button.title = temporarilyBusy
+    ? "当前正在连接、更新或检测节点，请稍后再试"
+    : "一键检测当前筛选结果，不会切换或断开当前连接";
+}
+
 function render(){
-  const versionLabel = state.app_version_label || "V2.1.5 正式版";
+  const versionLabel = state.app_version_label || "V2.1.7 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
     const modeLabel = state.deployment_mode_label || "Python 源码";
     $("deployment_mode_label").textContent = `${modeLabel}部署 · 更新通道：main`;
   }
+  renderBatchTestButton();
 
   const activeNode = nodes.find(n => n && n.active);
   
@@ -5195,16 +5380,20 @@ function render(){
       const ipTypeTitle = `${translateIpType(n.ip_type)} · 置信度：${translateConfidence(n.ip_type_confidence)} · 来源：${(n.ip_type_sources || []).join(" + ") || "未知"}`;
       
       const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
+      const isBatchQueued = batchTestQueuedIds.has(String(n.id));
+      const testDisabled = isTesting || batchTest.running;
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
-      const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
-      const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
+      const testBtnText = isTesting
+        ? `${testSpinner}检测中`
+        : (isBatchQueued ? "排队中" : (batchTest.running ? "批量检测中" : "检测"));
+      const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${testDisabled ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${(isUnavailable || isTesting || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">${isPending ? '切换中' : '切换'}</button>`;
+        : `<button class="connect-btn" ${(isUnavailable || isTesting || state.is_connecting || batchTest.running) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">${isPending ? '切换中' : '切换'}</button>`;
       
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
@@ -5262,7 +5451,7 @@ $("btn_last_page").onclick = () => {
 
 async function testNode(btn, id, event){
   if (event) event.stopPropagation();
-  if (testingNodeIds.has(id)) return;
+  if (batchTest.running || testingNodeIds.has(id)) return;
   testingNodeIds.add(id);
   render();
   
@@ -5284,6 +5473,121 @@ async function testNode(btn, id, event){
   } finally {
     testingNodeIds.delete(id);
     render();
+  }
+}
+
+async function toggleBatchTest() {
+  if (batchTest.running) {
+    batchTest.cancelRequested = true;
+    renderBatchTestButton();
+    return;
+  }
+  if (state.is_connecting || state.maintenance_running || testingNodeIds.size) {
+    alert("当前正在连接、更新或检测节点，请稍后再试");
+    return;
+  }
+
+  const ids = getBatchTestCandidates().map(n => String(n.id));
+  if (!ids.length) {
+    alert("当前筛选结果中没有可检测节点");
+    return;
+  }
+
+  if (batchTestResetTimer) {
+    clearTimeout(batchTestResetTimer);
+    batchTestResetTimer = null;
+  }
+  Object.assign(batchTest, {
+    running: true,
+    cancelRequested: false,
+    total: ids.length,
+    completed: 0,
+    available: 0,
+    unavailable: 0,
+    outcome: ""
+  });
+  batchTestQueuedIds.clear();
+  ids.forEach(id => batchTestQueuedIds.add(id));
+  render();
+
+  let fatalError = "";
+  const ownedTestingIds = new Set();
+  try {
+    for (let offset = 0; offset < ids.length; offset += BATCH_TEST_SIZE) {
+      if (batchTest.cancelRequested) break;
+      const batchIds = ids.slice(offset, offset + BATCH_TEST_SIZE);
+      batchIds.forEach(id => {
+        batchTestQueuedIds.delete(id);
+        testingNodeIds.add(id);
+        ownedTestingIds.add(id);
+      });
+      render();
+
+      try {
+        const response = await fetchWithTimeout("./api/test_nodes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids: batchIds })
+        }, 70000);
+        const result = await readJsonResponse(response, "批量检测失败");
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || `批量检测失败 (${response.status})`);
+        }
+
+        const results = Array.isArray(result.nodes) ? result.nodes : [];
+        const resultById = new Map(results.map(node => [String((node && node.id) || ""), node]));
+        for (const id of batchIds) {
+          const updated = resultById.get(id);
+          if (!updated) continue;
+          const index = nodes.findIndex(node => node && String(node.id) === id);
+          if (index >= 0) {
+            nodes[index] = Object.assign({}, nodes[index], updated);
+          }
+          if (updated.probe_status === "available") batchTest.available += 1;
+          else batchTest.unavailable += 1;
+          batchTest.completed += 1;
+        }
+        if (results.length < batchIds.length) {
+          throw new Error(`本批有 ${batchIds.length - results.length} 个节点未返回检测结果`);
+        }
+        stableSortNodes();
+      } finally {
+        batchIds.forEach(id => {
+          testingNodeIds.delete(id);
+          ownedTestingIds.delete(id);
+        });
+      }
+      render();
+    }
+  } catch (error) {
+    fatalError = error && error.message ? error.message : "未知错误";
+  } finally {
+    ownedTestingIds.forEach(id => testingNodeIds.delete(id));
+    batchTestQueuedIds.clear();
+    const cancelled = batchTest.cancelRequested;
+    batchTest.running = false;
+    batchTest.cancelRequested = false;
+
+    try {
+      const snapshot = await fetchNodesSnapshot();
+      applyNodesSnapshot(snapshot);
+    } catch (snapshotError) {
+      console.warn("批量检测完成后同步节点状态失败", snapshotError);
+    }
+
+    batchTest.outcome = fatalError
+      ? `检测中断：已完成 ${batchTest.completed}/${batchTest.total}`
+      : (cancelled
+        ? `已停止：完成 ${batchTest.completed}/${batchTest.total}`
+        : `检测完成：可用 ${batchTest.available} · 不可用 ${batchTest.unavailable}`);
+    render();
+    batchTestResetTimer = setTimeout(() => {
+      batchTest.outcome = "";
+      renderBatchTestButton();
+    }, 8000);
+    if (fatalError) {
+      alert("一键检测已中断: " + fatalError);
+    }
   }
 }
 
@@ -5556,6 +5860,10 @@ $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
 
 $("refresh").onclick=async()=>{
+  if (batchTest.running) {
+    alert("请先停止一键检测，再更新节点");
+    return;
+  }
   refreshButtonBusy("正在启动更新...");
   try{
     const response = await fetchWithTimeout("./api/refresh_nodes",{
@@ -7165,7 +7473,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "节点 ID 列表无效"}, HTTPStatus.BAD_REQUEST)
                     return
                 node_ids = [str(node_id or "").strip() for node_id in node_ids]
-                node_ids = [node_id for node_id in node_ids if node_id]
+                node_ids = list(dict.fromkeys(node_id for node_id in node_ids if node_id))
+                with lock:
+                    current_nodes = read_nodes()
+                    protected_node_ids = {
+                        str(node.get("id") or "")
+                        for node in current_nodes
+                        if node.get("active")
+                    }
+                    if active_openvpn_node_id:
+                        protected_node_ids.add(str(active_openvpn_node_id))
+                node_ids = [node_id for node_id in node_ids if node_id not in protected_node_ids]
                 if len(node_ids) > MANUAL_TEST_NODE_LIMIT:
                     self.send_json({"ok": False, "error": f"单次最多测试 {MANUAL_TEST_NODE_LIMIT} 个节点"}, HTTPStatus.BAD_REQUEST)
                     return
