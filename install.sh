@@ -54,6 +54,7 @@ DEFAULT_REPO="aimili-vpngate"
 # Allow custom repository override via command line arguments
 GITHUB_USER="${1:-${DEFAULT_USER}}"
 GITHUB_REPO="${2:-${DEFAULT_REPO}}"
+REQUESTED_BRANCH="${3:-}"
 
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
 
@@ -82,7 +83,11 @@ fi
 
 # 4. Clone or pull the repository
 INSTALL_DIR="/opt/aimilivpn"
-DEPLOY_BRANCH="main"
+CURRENT_BRANCH=""
+if [ -z "${REQUESTED_BRANCH}" ] && [ -d "${INSTALL_DIR}/.git" ]; then
+    CURRENT_BRANCH="$(git -C "${INSTALL_DIR}" branch --show-current 2>/dev/null || true)"
+fi
+DEPLOY_BRANCH="${AIMILIVPN_DEPLOY_BRANCH:-${REQUESTED_BRANCH:-${CURRENT_BRANCH:-main}}}"
 
 echo -e "\n${YELLOW}[2/4] 正在从 GitHub 部署源代码到 ${INSTALL_DIR} (目标分支: ${DEPLOY_BRANCH})...${PLAIN}"
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
@@ -522,7 +527,6 @@ def show_logs():
         time.sleep(2)
 
 def update_service():
-    print("正在从 GitHub main 主分支检测正式版更新...", flush=True)
     if os.path.exists(INSTALL_DIR):
         try:
             os.chdir(INSTALL_DIR)
@@ -531,7 +535,14 @@ def update_service():
                 time.sleep(3)
                 return
             
-            branch = "main"
+            branch_result = subprocess.run(
+                ["git", "branch", "--show-current"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            branch = branch_result.stdout.strip() or "main"
+            print(f"正在从 GitHub {branch} 分支检测更新...", flush=True)
             subprocess.run(
                 ["git", "fetch", "origin", branch],
                 check=True,
@@ -556,7 +567,7 @@ def update_service():
                     time.sleep(1.5)
                     return
             
-            print(f"\n正在切换并重置到正式版 origin/{branch} ...", flush=True)
+            print(f"\n正在切换并重置到当前通道 origin/{branch} ...", flush=True)
             subprocess.run(["git", "checkout", "-B", branch, f"origin/{branch}"], check=True)
             subprocess.run(["git", "reset", "--hard", f"origin/{branch}"], check=True)
             
@@ -565,7 +576,7 @@ def update_service():
             subprocess.run(["find", ".", "-type", "d", "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"], check=False)
             
             print("代码拉取成功，正在重新运行安装脚本...", flush=True)
-            subprocess.run(["bash", "install.sh"])
+            subprocess.run(["bash", "install.sh"], check=True)
             print("更新已完成！")
             time.sleep(2)
         except Exception as e:

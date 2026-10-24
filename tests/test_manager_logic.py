@@ -83,6 +83,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "DATA_DIR", root),
             mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
             mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "HISTORY_DB_FILE", root / "node_history.sqlite3"),
             mock.patch.object(manager, "STATE_FILE", root / "state.json"),
             mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
             mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
@@ -647,6 +648,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "cleanup_policy_routing"),
             mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
             mock.patch.object(manager, "check_proxy_health", return_value={"ok": False, "error": "no route"}),
+            mock.patch.object(manager, "record_history_connection") as history_mock,
             mock.patch.object(manager, "log_to_json"),
         ):
             with self.assertRaisesRegex(RuntimeError, "代理出口不可用"):
@@ -657,6 +659,46 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("", manager.active_openvpn_node_id)
         stored = manager.read_nodes()
         self.assertEqual("unavailable", stored[0]["probe_status"])
+        history_mock.assert_not_called()
+
+    def test_routing_policy_rejection_does_not_penalize_history_node(self) -> None:
+        nodes = self.write_nodes(1)
+
+        with (
+            mock.patch.object(
+                manager,
+                "validate_node_allowed_by_routing",
+                side_effect=ValueError("该节点不符合当前路由策略"),
+            ),
+            mock.patch.object(manager, "record_history_connection") as history_mock,
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            with self.assertRaisesRegex(ValueError, "路由策略"):
+                manager.connect_node(nodes[0]["id"])
+
+        history_mock.assert_not_called()
+
+    def test_real_openvpn_handshake_failure_penalizes_node_once(self) -> None:
+        nodes = self.write_nodes(1)
+
+        with (
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(False, "AUTH_FAILED", None),
+            ),
+            mock.patch.object(manager, "cleanup_policy_routing"),
+            mock.patch.object(manager, "record_history_connection") as history_mock,
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "AUTH_FAILED"):
+                manager.connect_node(nodes[0]["id"])
+
+        history_mock.assert_called_once_with(
+            nodes[0]["id"],
+            False,
+            message="AUTH_FAILED",
+        )
 
     def test_successful_connection_schedules_stale_proxy_session_reset(self) -> None:
         nodes = self.write_nodes(1)
@@ -743,6 +785,29 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("没有拉取到新节点", result)
         self.assertTrue(process.running)
         stop_mock.assert_not_called()
+
+    def test_source_failure_preserves_existing_nodes_json_pool(self) -> None:
+        original_nodes = self.write_nodes(2)
+        original_ids = {node["id"] for node in original_nodes}
+
+        with (
+            mock.patch.object(manager, "fetch_candidates", side_effect=TimeoutError("source offline")),
+            mock.patch.object(manager.vpn_utils, "check_and_fix_dns"),
+            mock.patch.object(
+                manager.vpn_utils,
+                "diagnose_api_failure",
+                return_value=("1001", "source offline"),
+            ),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            result = manager.maintain_valid_nodes()
+
+        self.assertNotEqual("没有拉取到新节点", result)
+        self.assertEqual(
+            original_ids,
+            {node["id"] for node in manager.read_nodes()},
+        )
 
     def test_fetch_timeout_skips_insecure_https_retry(self) -> None:
         csv_text = valid_snapshot()
@@ -917,9 +982,9 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(20, entries[0]["index"])
         self.assertEqual(519, entries[-1]["index"])
 
-    def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("2.1.5", manager.APP_VERSION)
-        self.assertEqual("V2.1.5 正式版", manager.APP_VERSION_LABEL)
+    def test_web_update_controls_expose_history_experiment_version(self) -> None:
+        self.assertEqual("2.1.7", manager.APP_VERSION)
+        self.assertEqual("V2.1.7 历史库实验版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -928,12 +993,13 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertNotIn(">测试版<", manager.INDEX_HTML)
         self.assertIn('id="deployment_mode_label"', manager.INDEX_HTML)
 
-    def test_installer_updates_only_from_main(self) -> None:
+    def test_installer_preserves_requested_or_current_branch(self) -> None:
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
 
-        self.assertIn('DEPLOY_BRANCH="main"', install_text)
-        self.assertIn('branch = "main"', install_text)
-        self.assertNotIn("CURRENT_BRANCH", install_text)
+        self.assertIn('REQUESTED_BRANCH="${3:-}"', install_text)
+        self.assertIn('CURRENT_BRANCH=""', install_text)
+        self.assertIn('branch_result = subprocess.run(', install_text)
+        self.assertNotIn('branch = "main"', install_text)
         self.assertNotIn("origin/master", install_text)
         self.assertNotIn("bate", install_text.lower())
 
@@ -1000,7 +1066,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V2.1.5 正式版", result["current_version_label"])
+        self.assertEqual("V2.1.7 历史库实验版", result["current_version_label"])
 
     def test_latest_release_check_reports_source_update_command(self) -> None:
         release = {"tag_name": "v2.2.0", "draft": False, "prerelease": False}
