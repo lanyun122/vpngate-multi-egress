@@ -2010,6 +2010,8 @@ def record_history_probe_results(results: list[dict[str, Any]]) -> None:
 def load_history_workset(
     fresh_candidates: list[dict[str, Any]],
     ui_cfg: dict[str, Any],
+    *,
+    allow_current: bool = False,
 ) -> list[dict[str, Any]]:
     try:
         if fresh_candidates:
@@ -2031,15 +2033,24 @@ def load_history_workset(
             favorite_node_ids=favorite_ids,
             exclude_endpoint_keys=fresh_keys,
             exclude_node_ids=excluded_ids,
+            include_current=allow_current,
         )
         valid_nodes: list[dict[str, Any]] = []
         for node in history_nodes:
-            try:
-                snapshot_utils.validate_openvpn_config(str(node.get("config_text") or ""))
-            except (TypeError, ValueError):
-                continue
             node_id = str(node.get("id") or "").strip()
             if not node_id:
+                continue
+            try:
+                snapshot_utils.validate_openvpn_config(str(node.get("config_text") or ""))
+            except (TypeError, ValueError) as exc:
+                try:
+                    node_history.archive_node(
+                        HISTORY_DB_FILE,
+                        node_id,
+                        message=f"历史配置无效: {exc}",
+                    )
+                except Exception as archive_exc:
+                    print(f"[历史节点库] 归档无效节点 {node_id} 失败: {archive_exc}", flush=True)
                 continue
             node["config_file"] = str(CONFIG_DIR / f"{safe_name(node_id)}.ovpn")
             node["active"] = False
@@ -2574,9 +2585,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         auto_switch_node()
                         is_connecting = True
 
+        fetch_succeeded = False
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
+            fetch_succeeded = True
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
@@ -2589,7 +2602,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
         ui_cfg = load_ui_config()
         fresh_candidates = list(candidates)
         fresh_candidate_count = len(fresh_candidates)
-        history_candidates = load_history_workset(fresh_candidates, ui_cfg)
+        history_candidates = load_history_workset(
+            fresh_candidates,
+            ui_cfg,
+            allow_current=not fetch_succeeded or not fresh_candidates,
+        )
         candidates = fresh_candidates + history_candidates
         if not candidates:
             return "没有拉取到新节点"
@@ -2678,7 +2695,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if not n.get("active") and n.get("probe_status") != "unavailable"
                 ]
                 fast_candidates = apply_routing_filters(fast_candidates, ui_cfg, include_unknown_ip_type=True)
-                fast_candidates.sort(key=probe_priority_key)
+                fast_candidates.sort(
+                    key=lambda node: (
+                        1 if node.get("history_only") else 0,
+                        probe_priority_key(node),
+                    )
+                )
                 fast_test_ids = [
                     n["id"] for n in fast_candidates
                     if n.get("id")
@@ -2764,7 +2786,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if not n.get("active") and n.get("id") not in initial_tested_ids
                 ]
                 to_test = apply_routing_filters(to_test, ui_cfg, include_unknown_ip_type=True)
-                to_test.sort(key=probe_priority_key)
+                to_test.sort(
+                    key=lambda node: (
+                        1 if node.get("history_only") else 0,
+                        probe_priority_key(node),
+                    )
+                )
                 to_test_ids = [n["id"] for n in to_test]
 
             msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
