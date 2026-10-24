@@ -648,6 +648,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "cleanup_policy_routing"),
             mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
             mock.patch.object(manager, "check_proxy_health", return_value={"ok": False, "error": "no route"}),
+            mock.patch.object(manager, "record_history_connection") as history_mock,
             mock.patch.object(manager, "log_to_json"),
         ):
             with self.assertRaisesRegex(RuntimeError, "代理出口不可用"):
@@ -658,6 +659,46 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("", manager.active_openvpn_node_id)
         stored = manager.read_nodes()
         self.assertEqual("unavailable", stored[0]["probe_status"])
+        history_mock.assert_not_called()
+
+    def test_routing_policy_rejection_does_not_penalize_history_node(self) -> None:
+        nodes = self.write_nodes(1)
+
+        with (
+            mock.patch.object(
+                manager,
+                "validate_node_allowed_by_routing",
+                side_effect=ValueError("该节点不符合当前路由策略"),
+            ),
+            mock.patch.object(manager, "record_history_connection") as history_mock,
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            with self.assertRaisesRegex(ValueError, "路由策略"):
+                manager.connect_node(nodes[0]["id"])
+
+        history_mock.assert_not_called()
+
+    def test_real_openvpn_handshake_failure_penalizes_node_once(self) -> None:
+        nodes = self.write_nodes(1)
+
+        with (
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(False, "AUTH_FAILED", None),
+            ),
+            mock.patch.object(manager, "cleanup_policy_routing"),
+            mock.patch.object(manager, "record_history_connection") as history_mock,
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "AUTH_FAILED"):
+                manager.connect_node(nodes[0]["id"])
+
+        history_mock.assert_called_once_with(
+            nodes[0]["id"],
+            False,
+            message="AUTH_FAILED",
+        )
 
     def test_successful_connection_schedules_stale_proxy_session_reset(self) -> None:
         nodes = self.write_nodes(1)
@@ -744,6 +785,29 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("没有拉取到新节点", result)
         self.assertTrue(process.running)
         stop_mock.assert_not_called()
+
+    def test_source_failure_preserves_existing_nodes_json_pool(self) -> None:
+        original_nodes = self.write_nodes(2)
+        original_ids = {node["id"] for node in original_nodes}
+
+        with (
+            mock.patch.object(manager, "fetch_candidates", side_effect=TimeoutError("source offline")),
+            mock.patch.object(manager.vpn_utils, "check_and_fix_dns"),
+            mock.patch.object(
+                manager.vpn_utils,
+                "diagnose_api_failure",
+                return_value=("1001", "source offline"),
+            ),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            result = manager.maintain_valid_nodes()
+
+        self.assertNotEqual("没有拉取到新节点", result)
+        self.assertEqual(
+            original_ids,
+            {node["id"] for node in manager.read_nodes()},
+        )
 
     def test_fetch_timeout_skips_insecure_https_retry(self) -> None:
         csv_text = valid_snapshot()
