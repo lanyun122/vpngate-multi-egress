@@ -83,6 +83,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "DATA_DIR", root),
             mock.patch.object(manager, "CONFIG_DIR", root / "configs"),
             mock.patch.object(manager, "NODES_FILE", root / "nodes.json"),
+            mock.patch.object(manager, "HISTORY_DB_FILE", root / "node_history.sqlite3"),
             mock.patch.object(manager, "STATE_FILE", root / "state.json"),
             mock.patch.object(manager, "AUTH_FILE", root / "auth.txt"),
             mock.patch.object(manager, "BLACKLIST_FILE", root / "blacklist.json"),
@@ -917,9 +918,9 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(20, entries[0]["index"])
         self.assertEqual(519, entries[-1]["index"])
 
-    def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("2.1.5", manager.APP_VERSION)
-        self.assertEqual("V2.1.5 正式版", manager.APP_VERSION_LABEL)
+    def test_web_update_controls_expose_history_experiment_version(self) -> None:
+        self.assertEqual("2.2.0", manager.APP_VERSION)
+        self.assertEqual("V2.2.0 历史库实验版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -928,12 +929,13 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertNotIn(">测试版<", manager.INDEX_HTML)
         self.assertIn('id="deployment_mode_label"', manager.INDEX_HTML)
 
-    def test_installer_updates_only_from_main(self) -> None:
+    def test_installer_preserves_requested_or_current_branch(self) -> None:
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
 
-        self.assertIn('DEPLOY_BRANCH="main"', install_text)
-        self.assertIn('branch = "main"', install_text)
-        self.assertNotIn("CURRENT_BRANCH", install_text)
+        self.assertIn('REQUESTED_BRANCH="${3:-}"', install_text)
+        self.assertIn('CURRENT_BRANCH=""', install_text)
+        self.assertIn('branch_result = subprocess.run(', install_text)
+        self.assertNotIn('branch = "main"', install_text)
         self.assertNotIn("origin/master", install_text)
         self.assertNotIn("bate", install_text.lower())
 
