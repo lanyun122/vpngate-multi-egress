@@ -268,69 +268,133 @@ def select_workset(
     favorite_node_ids: Iterable[str] | None = None,
     exclude_endpoint_keys: Iterable[str] | None = None,
     exclude_node_ids: Iterable[str] | None = None,
+    include_current: bool = False,
     now: float | None = None,
 ) -> list[dict[str, Any]]:
     initialize(db_path)
+    requested_limit = max(0, int(limit))
+    if requested_limit == 0:
+        return []
+
     timestamp = _now(now)
     countries = {str(code).strip().upper() for code in (country_codes or []) if str(code).strip()}
     favorites = {str(value) for value in (favorite_node_ids or []) if str(value)}
     excluded_keys = {str(value) for value in (exclude_endpoint_keys or []) if str(value)}
     excluded_ids = {str(value) for value in (exclude_node_ids or []) if str(value)}
-    fetch_limit = max(1, int(limit)) * 5
+
+    where_parts = ["archived = 0", "next_probe_at <= ?"]
+    where_params: list[Any] = [timestamp]
+    if not include_current:
+        where_parts.append("in_current_pool = 0")
+    if countries:
+        country_values = sorted(countries)
+        placeholders = ",".join("?" for _ in country_values)
+        where_parts.append(f"UPPER(country_short) IN ({placeholders})")
+        where_params.extend(country_values)
+
+    order_parts: list[str] = []
+    order_params: list[Any] = []
+    if favorites:
+        favorite_values = sorted(favorites)
+        placeholders = ",".join("?" for _ in favorite_values)
+        order_parts.append(f"CASE WHEN node_id IN ({placeholders}) THEN 0 ELSE 1 END")
+        order_params.extend(favorite_values)
+    order_parts.extend(
+        [
+            "CASE WHEN probe_success_count + connect_success_count > 0 THEN 0 ELSE 1 END",
+            "(probe_success_count + connect_success_count) DESC",
+            "consecutive_failures ASC",
+            "source_score DESC",
+            "last_seen_at DESC",
+        ]
+    )
+
+    # Page through due rows so a large fresh snapshot or a large blacklist cannot
+    # starve older historical nodes before the Python-side exclusions are applied.
+    page_size = max(100, min(500, requested_limit * 5))
+    offset = 0
+    selected: list[dict[str, Any]] = []
+    query = f"""
+        SELECT *
+        FROM node_history
+        WHERE {' AND '.join(where_parts)}
+        ORDER BY {', '.join(order_parts)}
+        LIMIT ? OFFSET ?
+    """
     with _database(db_path) as connection:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM node_history
-            WHERE archived = 0 AND next_probe_at <= ?
-            ORDER BY
-                CASE WHEN probe_success_count + connect_success_count > 0 THEN 0 ELSE 1 END,
-                (probe_success_count + connect_success_count) DESC,
-                consecutive_failures ASC,
-                source_score DESC,
-                last_seen_at DESC
-            LIMIT ?
-            """,
-            (timestamp, fetch_limit),
-        ).fetchall()
+        while len(selected) < requested_limit:
+            rows = connection.execute(
+                query,
+                (*where_params, *order_params, page_size, offset),
+            ).fetchall()
+            if not rows:
+                break
+            offset += len(rows)
 
-    selected: list[tuple[int, dict[str, Any]]] = []
-    for row in rows:
-        if row["endpoint_key"] in excluded_keys or row["node_id"] in excluded_ids:
-            continue
-        if countries and str(row["country_short"] or "").upper() not in countries:
-            continue
-        try:
-            node = json.loads(row["node_json"] or "{}")
-        except json.JSONDecodeError:
-            node = {}
-        if not isinstance(node, dict):
-            node = {}
-        node.update(
-            {
-                "id": row["node_id"],
-                "ip": row["ip"],
-                "remote_host": row["remote_host"],
-                "remote_port": row["remote_port"],
-                "proto": row["proto"],
-                "country": row["country"],
-                "country_short": row["country_short"],
-                "score": row["source_score"],
-                "config_text": row["config_text"],
-                "active": False,
-                "probe_status": "not_checked",
-                "probe_message": "历史节点待复测",
-                "probed_at": 0,
-                "history_only": True,
-                "history_status": "历史复测",
-                "history_force_probe": True,
-                "history_endpoint_key": row["endpoint_key"],
-            }
-        )
-        selected.append((0 if row["node_id"] in favorites else 1, node))
-    selected.sort(key=lambda item: item[0])
-    return [node for _, node in selected[: max(0, int(limit))]]
+            for row in rows:
+                if row["endpoint_key"] in excluded_keys or row["node_id"] in excluded_ids:
+                    continue
+                try:
+                    node = json.loads(row["node_json"] or "{}")
+                except json.JSONDecodeError:
+                    node = {}
+                if not isinstance(node, dict):
+                    node = {}
+                node.update(
+                    {
+                        "id": row["node_id"],
+                        "ip": row["ip"],
+                        "remote_host": row["remote_host"],
+                        "remote_port": row["remote_port"],
+                        "proto": row["proto"],
+                        "country": row["country"],
+                        "country_short": row["country_short"],
+                        "score": row["source_score"],
+                        "config_text": row["config_text"],
+                        "active": False,
+                        "probe_status": "not_checked",
+                        "probe_message": "历史节点待复测",
+                        "probed_at": 0,
+                        "history_only": True,
+                        "history_status": "历史复测",
+                        "history_force_probe": True,
+                        "history_endpoint_key": row["endpoint_key"],
+                    }
+                )
+                selected.append(node)
+                if len(selected) >= requested_limit:
+                    break
 
+            if len(rows) < page_size:
+                break
+
+    return selected
+
+
+def archive_node(
+    db_path: str | Path,
+    node_id: str,
+    *,
+    message: str = "",
+    now: float | None = None,
+) -> bool:
+    initialize(db_path)
+    timestamp = _now(now)
+    with _write_lock:
+        with _database(db_path) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE node_history
+                SET archived = 1,
+                    in_current_pool = 0,
+                    last_probe_status = 'invalid_config',
+                    last_probe_message = ?,
+                    updated_at = ?
+                WHERE node_id = ?
+                """,
+                (str(message or "历史配置无效"), timestamp, str(node_id)),
+            )
+            return cursor.rowcount > 0
 
 def record_probe_results(db_path: str | Path, results: Iterable[dict[str, Any]], now: float | None = None) -> int:
     initialize(db_path)
