@@ -576,7 +576,7 @@ def update_service():
             subprocess.run(["find", ".", "-type", "d", "-name", "__pycache__", "-exec", "rm", "-rf", "{}", "+"], check=False)
             
             print("代码拉取成功，正在重新运行安装脚本...", flush=True)
-            subprocess.run(["bash", "install.sh"])
+            subprocess.run(["bash", "install.sh"], check=True)
             print("更新已完成！")
             time.sleep(2)
         except Exception as e:
