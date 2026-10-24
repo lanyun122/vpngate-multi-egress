@@ -22,7 +22,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY VERSION README.md LICENSE ./
-COPY vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py ./
+COPY vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py node_history.py ./
 COPY mirror ./mirror
 
 ENV PYTHONUNBUFFERED=1 \
@@ -35,7 +35,7 @@ ENV PYTHONUNBUFFERED=1 \
     LOCAL_PROXY_PORT=7928
 
 RUN mkdir -p /data \
-    && python3 -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py
+    && python3 -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py node_history.py
 
 VOLUME ["/data"]
 EXPOSE 8787/tcp 7928/tcp
