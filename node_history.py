@@ -282,10 +282,14 @@ def select_workset(
     excluded_keys = {str(value) for value in (exclude_endpoint_keys or []) if str(value)}
     excluded_ids = {str(value) for value in (exclude_node_ids or []) if str(value)}
 
-    where_parts = ["archived = 0", "next_probe_at <= ?"]
+    where_parts = ["archived = 0"]
     where_params: list[Any] = [timestamp]
-    if not include_current:
-        where_parts.append("in_current_pool = 0")
+    if include_current:
+        # During source outages the latest current pool is a recovery source,
+        # even when its normal success recheck is scheduled for later.
+        where_parts.append("(next_probe_at <= ? OR in_current_pool = 1)")
+    else:
+        where_parts.extend(["next_probe_at <= ?", "in_current_pool = 0"])
     if countries:
         country_values = sorted(countries)
         placeholders = ",".join("?" for _ in country_values)
