@@ -190,15 +190,22 @@ class NodeHistoryTests(unittest.TestCase):
         self.assertNotIn("fresh-0", [node["id"] for node in selected])
 
     def test_current_pool_can_be_reused_only_when_explicitly_allowed(self) -> None:
-        current = make_node("current-node", "198.51.100.50", country_short="JP")
+        current = make_node(
+            "current-node",
+            "198.51.100.50",
+            country_short="JP",
+            probe_status="available",
+        )
         node_history.sync_snapshot(self.db_path, [current], now=100)
 
-        normal = node_history.select_workset(self.db_path, limit=5, now=100)
+        # A successful node is normally not due again for six hours. Source
+        # outage recovery must still be able to rebuild from that current pool.
+        normal = node_history.select_workset(self.db_path, limit=5, now=101)
         fallback = node_history.select_workset(
             self.db_path,
             limit=5,
             include_current=True,
-            now=100,
+            now=101,
         )
 
         self.assertEqual([], normal)
