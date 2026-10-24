@@ -152,6 +152,7 @@ class NodeHistoryTests(unittest.TestCase):
             country_codes=["JP"],
             favorite_node_ids=["jp-b"],
             exclude_endpoint_keys=[node_history.endpoint_key(jp_a)],
+            include_current=True,
             now=100,
         )
 
@@ -159,6 +160,72 @@ class NodeHistoryTests(unittest.TestCase):
         self.assertTrue(selected[0]["history_only"])
         self.assertEqual("not_checked", selected[0]["probe_status"])
         self.assertNotIn("config_file", selected[0])
+
+    def test_large_fresh_pool_cannot_starve_due_history_node(self) -> None:
+        old_node = make_node("old-node", "203.0.113.200", country_short="JP")
+        node_history.sync_snapshot(self.db_path, [old_node], now=100)
+
+        fresh_nodes = [
+            make_node(
+                f"fresh-{index}",
+                f"198.51.{index // 250}.{index % 250 + 1}",
+                country_short="JP",
+            )
+            for index in range(300)
+        ]
+        node_history.sync_snapshot(self.db_path, fresh_nodes, now=200)
+
+        selected = node_history.select_workset(
+            self.db_path,
+            limit=25,
+            country_codes=["JP"],
+            exclude_endpoint_keys=[
+                node_history.endpoint_key(node)
+                for node in fresh_nodes
+            ],
+            now=200,
+        )
+
+        self.assertIn("old-node", [node["id"] for node in selected])
+        self.assertNotIn("fresh-0", [node["id"] for node in selected])
+
+    def test_current_pool_can_be_reused_only_when_explicitly_allowed(self) -> None:
+        current = make_node("current-node", "198.51.100.50", country_short="JP")
+        node_history.sync_snapshot(self.db_path, [current], now=100)
+
+        normal = node_history.select_workset(self.db_path, limit=5, now=100)
+        fallback = node_history.select_workset(
+            self.db_path,
+            limit=5,
+            include_current=True,
+            now=100,
+        )
+
+        self.assertEqual([], normal)
+        self.assertEqual(["current-node"], [node["id"] for node in fallback])
+
+    def test_invalid_config_can_be_archived(self) -> None:
+        node = make_node("invalid-node", "198.51.100.60")
+        node_history.sync_snapshot(self.db_path, [node], now=100)
+
+        changed = node_history.archive_node(
+            self.db_path,
+            "invalid-node",
+            message="invalid config",
+            now=200,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(1, self.row("invalid-node")["archived"])
+        self.assertEqual(
+            [],
+            node_history.select_workset(
+                self.db_path,
+                limit=5,
+                include_current=True,
+                now=200,
+            ),
+        )
 
     def test_real_connection_success_is_strong_positive_signal(self) -> None:
         node_history.sync_snapshot(self.db_path, [make_node("node-a", "198.51.100.20")], now=100)
