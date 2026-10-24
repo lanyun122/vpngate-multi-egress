@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -74,10 +75,20 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _database(db_path: str | Path):
+    connection = _connect(db_path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def initialize(db_path: str | Path) -> None:
     path = Path(db_path)
     with _write_lock:
-        with _connect(path) as connection:
+        with _database(path) as connection:
             connection.executescript(_SCHEMA)
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         try:
@@ -138,7 +149,7 @@ def _initial_probe_values(node: dict[str, Any], now: float) -> tuple[str, int, i
 
 def seed_if_empty(db_path: str | Path, nodes: Iterable[dict[str, Any]], now: float | None = None) -> int:
     initialize(db_path)
-    with _connect(db_path) as connection:
+    with _database(db_path) as connection:
         existing = int(connection.execute("SELECT COUNT(*) FROM node_history").fetchone()[0])
     if existing:
         return 0
@@ -156,7 +167,7 @@ def sync_snapshot(
     timestamp = _now(now)
     normalized_nodes = [dict(node) for node in nodes if isinstance(node, dict) and node.get("id")]
     with _write_lock:
-        with _connect(db_path) as connection:
+        with _database(db_path) as connection:
             if mark_missing and normalized_nodes:
                 connection.execute("UPDATE node_history SET in_current_pool = 0, updated_at = ?", (timestamp,))
             for node in normalized_nodes:
@@ -266,7 +277,7 @@ def select_workset(
     excluded_keys = {str(value) for value in (exclude_endpoint_keys or []) if str(value)}
     excluded_ids = {str(value) for value in (exclude_node_ids or []) if str(value)}
     fetch_limit = max(1, int(limit)) * 5
-    with _connect(db_path) as connection:
+    with _database(db_path) as connection:
         rows = connection.execute(
             """
             SELECT *
@@ -326,7 +337,7 @@ def record_probe_results(db_path: str | Path, results: Iterable[dict[str, Any]],
     timestamp = _now(now)
     changed = 0
     with _write_lock:
-        with _connect(db_path) as connection:
+        with _database(db_path) as connection:
             for result in results:
                 node_id = str(result.get("id") or "")
                 if not node_id:
@@ -384,7 +395,7 @@ def record_connection_result(
     initialize(db_path)
     timestamp = _now(now)
     with _write_lock:
-        with _connect(db_path) as connection:
+        with _database(db_path) as connection:
             row = connection.execute(
                 "SELECT consecutive_failures FROM node_history WHERE node_id = ? ORDER BY last_seen_at DESC LIMIT 1",
                 (str(node_id),),
@@ -423,7 +434,7 @@ def record_connection_result(
 def statistics(db_path: str | Path, now: float | None = None) -> dict[str, int]:
     initialize(db_path)
     timestamp = _now(now)
-    with _connect(db_path) as connection:
+    with _database(db_path) as connection:
         row = connection.execute(
             """
             SELECT
@@ -467,7 +478,7 @@ def cleanup(
     archived = 0
     deleted = 0
     with _write_lock:
-        with _connect(db_path) as connection:
+        with _database(db_path) as connection:
             cursor = connection.execute(
                 f"""
                 UPDATE node_history
