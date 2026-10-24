@@ -1988,6 +1988,7 @@ def is_systemic_probe_failure(message: Any) -> bool:
             "err_ovpn_cmd_not_found",
             "err_ovpn_permission_denied",
             "err_ovpn_tun_not_available",
+            "err_ovpn_start_failed",
             "no such file or directory",
             "cannot open tun/tap dev",
             "cannot allocate tun",
@@ -2012,23 +2013,30 @@ def load_history_workset(
     ui_cfg: dict[str, Any],
     *,
     allow_current: bool = False,
+    exclude_candidates: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     try:
         if fresh_candidates:
             node_history.sync_snapshot(HISTORY_DB_FILE, fresh_candidates)
+        exclusion_nodes = [*fresh_candidates, *(exclude_candidates or [])]
         fresh_keys = {
             node_history.endpoint_key(node)
-            for node in fresh_candidates
+            for node in exclusion_nodes
             if node.get("id")
         }
         blacklist_ids = set(load_blacklist().keys())
         excluded_ids = blacklist_ids | {str(active_openvpn_node_id or "")}
+        excluded_ids.update(
+            str(node.get("id") or "")
+            for node in (exclude_candidates or [])
+            if node.get("id")
+        )
         favorite_ids = ui_cfg.get("favorite_node_ids", [])
         if not isinstance(favorite_ids, list):
             favorite_ids = []
         history_nodes = node_history.select_workset(
             HISTORY_DB_FILE,
-            limit=HISTORY_WORKSET_LIMIT,
+            limit=HISTORY_WORKSET_LIMIT * 2,
             country_codes=normalize_discovery_countries(ui_cfg.get("discovery_countries")),
             favorite_node_ids=favorite_ids,
             exclude_endpoint_keys=fresh_keys,
@@ -2059,6 +2067,8 @@ def load_history_workset(
             node["history_only"] = True
             node["history_force_probe"] = True
             valid_nodes.append(node)
+            if len(valid_nodes) >= HISTORY_WORKSET_LIMIT:
+                break
         return valid_nodes
     except Exception as exc:
         print(f"[历史节点库] 提取复测节点失败，已继续使用本轮新节点: {exc}", flush=True)
@@ -2434,6 +2444,8 @@ def connect_node(
             write_json(NODES_FILE, sort_all_nodes(nodes))
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
+            if not is_systemic_probe_failure(message):
+                record_history_connection(node_id, False, message=str(message))
             raise RuntimeError(message)
             
         with lock:
@@ -2542,8 +2554,6 @@ def connect_node(
             clear_active_connection_state(f"连接失败: {exc}")
         else:
             set_state(is_connecting=False, pending_node_id="", last_check_message=f"连接失败: {exc}")
-        if node is not None and not is_systemic_probe_failure(str(exc)):
-            record_history_connection(node_id, False, message=str(exc))
         raise
     finally:
         finish_connection_attempt(token, cancel_event)
@@ -2602,12 +2612,21 @@ def maintain_valid_nodes(force: bool = False) -> str:
         ui_cfg = load_ui_config()
         fresh_candidates = list(candidates)
         fresh_candidate_count = len(fresh_candidates)
+        preserved_candidates: list[dict[str, Any]] = []
+        if not fetch_succeeded or not fresh_candidates:
+            with lock:
+                preserved_candidates = [
+                    dict(node)
+                    for node in read_nodes()
+                    if isinstance(node, dict) and node.get("id")
+                ]
         history_candidates = load_history_workset(
             fresh_candidates,
             ui_cfg,
             allow_current=not fetch_succeeded or not fresh_candidates,
+            exclude_candidates=preserved_candidates,
         )
-        candidates = fresh_candidates + history_candidates
+        candidates = fresh_candidates + preserved_candidates + history_candidates
         if not candidates:
             return "没有拉取到新节点"
 
