@@ -123,6 +123,9 @@ INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
 HISTORY_WORKSET_LIMIT = env_int("HISTORY_WORKSET_LIMIT", 25, 0, 100)
 HISTORY_RETEST_PER_CYCLE = env_int("HISTORY_RETEST_PER_CYCLE", 5, 0, 20)
+DISCOVERY_UNTESTED_PER_CYCLE = env_int("DISCOVERY_UNTESTED_PER_CYCLE", 10, 0, 50)
+HISTORY_SUCCESS_RETEST_PER_CYCLE = env_int("HISTORY_SUCCESS_RETEST_PER_CYCLE", 5, 0, 20)
+HISTORY_FAILED_RETEST_PER_CYCLE = env_int("HISTORY_FAILED_RETEST_PER_CYCLE", 5, 0, 20)
 HISTORY_MAX_ROWS = env_int("HISTORY_MAX_ROWS", 10000, 100, 100000)
 PROXY_FAILURE_THRESHOLD = env_int("PROXY_FAILURE_THRESHOLD", 3, 1, 10)
 SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 180, 0, 3600)
@@ -511,6 +514,10 @@ def history_database_stats() -> dict[str, int]:
         "history_ever_available": 0,
         "history_due": 0,
         "history_archived": 0,
+        "history_available_unique_ips": 0,
+        "history_untested_due": 0,
+        "history_retest_due": 0,
+        "history_failure_cooldown": 0,
     }
     try:
         defaults.update(node_history.statistics(HISTORY_DB_FILE))
@@ -1933,7 +1940,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     idx = None
     try:
         idx = get_free_test_index()
-        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=OPENVPN_TEST_TIMEOUT_SECONDS, dev=f"tun{idx}")
     finally:
         if idx is not None:
             release_test_index(idx)
@@ -2015,36 +2022,28 @@ def load_history_workset(
     allow_current: bool = False,
     exclude_candidates: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Return an oversized fair plan; the scheduler applies the per-cycle quotas."""
+    del allow_current
     try:
         if fresh_candidates:
             node_history.sync_snapshot(HISTORY_DB_FILE, fresh_candidates)
-        exclusion_nodes = [*fresh_candidates, *(exclude_candidates or [])]
-        fresh_keys = {
-            node_history.endpoint_key(node)
-            for node in exclusion_nodes
-            if node.get("id")
-        }
         blacklist_ids = set(load_blacklist().keys())
         excluded_ids = blacklist_ids | {str(active_openvpn_node_id or "")}
-        excluded_ids.update(
-            str(node.get("id") or "")
-            for node in (exclude_candidates or [])
-            if node.get("id")
-        )
         favorite_ids = ui_cfg.get("favorite_node_ids", [])
         if not isinstance(favorite_ids, list):
             favorite_ids = []
-        history_nodes = node_history.select_workset(
+        plan_nodes = node_history.select_probe_plan(
             HISTORY_DB_FILE,
-            limit=HISTORY_WORKSET_LIMIT * 2,
+            untested_limit=DISCOVERY_UNTESTED_PER_CYCLE * 2,
+            known_good_limit=HISTORY_SUCCESS_RETEST_PER_CYCLE * 2,
+            retry_limit=HISTORY_FAILED_RETEST_PER_CYCLE * 2,
             country_codes=normalize_discovery_countries(ui_cfg.get("discovery_countries")),
             favorite_node_ids=favorite_ids,
-            exclude_endpoint_keys=fresh_keys,
             exclude_node_ids=excluded_ids,
-            include_current=allow_current,
+            include_current=True,
         )
         valid_nodes: list[dict[str, Any]] = []
-        for node in history_nodes:
+        for node in plan_nodes:
             node_id = str(node.get("id") or "").strip()
             if not node_id:
                 continue
@@ -2062,16 +2061,11 @@ def load_history_workset(
                 continue
             node["config_file"] = str(CONFIG_DIR / f"{safe_name(node_id)}.ovpn")
             node["active"] = False
-            node["probe_status"] = "not_checked"
-            node["probe_message"] = "历史节点待复测"
-            node["history_only"] = True
             node["history_force_probe"] = True
             valid_nodes.append(node)
-            if len(valid_nodes) >= HISTORY_WORKSET_LIMIT:
-                break
         return valid_nodes
     except Exception as exc:
-        print(f"[历史节点库] 提取复测节点失败，已继续使用本轮新节点: {exc}", flush=True)
+        print(f"[历史节点库] 生成公平检测计划失败，已继续使用本轮新节点: {exc}", flush=True)
         return []
 
 def test_multiple_nodes(node_ids: list[str], target_available: int | None = None) -> list[dict[str, Any]]:
@@ -2114,7 +2108,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
-            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
+            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=OPENVPN_TEST_TIMEOUT_SECONDS, dev=dev_name)
         finally:
             if tun_idx is not None:
                 release_test_index(tun_idx)
@@ -2620,13 +2614,42 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     for node in read_nodes()
                     if isinstance(node, dict) and node.get("id")
                 ]
-        history_candidates = load_history_workset(
+        probe_plan_candidates = load_history_workset(
             fresh_candidates,
             ui_cfg,
             allow_current=not fetch_succeeded or not fresh_candidates,
             exclude_candidates=preserved_candidates,
         )
-        candidates = fresh_candidates + preserved_candidates + history_candidates
+        probe_plan_by_id = {
+            str(node.get("id") or ""): node
+            for node in probe_plan_candidates
+            if node.get("id")
+        }
+        base_candidates = fresh_candidates + preserved_candidates
+        for candidate in base_candidates:
+            planned = probe_plan_by_id.get(str(candidate.get("id") or ""))
+            if not planned:
+                continue
+            for key in (
+                "probe_queue",
+                "probe_due_at",
+                "history_status",
+                "history_force_probe",
+                "history_endpoint_key",
+            ):
+                if key in planned:
+                    candidate[key] = planned[key]
+        base_ids = {
+            str(node.get("id") or "")
+            for node in base_candidates
+            if node.get("id")
+        }
+        restored_history_candidates = [
+            node
+            for node in probe_plan_candidates
+            if str(node.get("id") or "") not in base_ids
+        ]
+        candidates = base_candidates + restored_history_candidates
         if not candidates:
             return "没有拉取到新节点"
 
@@ -2680,12 +2703,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
             if len(merged) > 1000:
                 merged = merged[:1000]
 
-            history_node_ids = [
-                str(node.get("id") or "")
-                for node in merged
-                if node.get("history_force_probe") and node.get("id")
-            ]
-                
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -2699,7 +2716,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
-        history_tested_results: list[dict[str, Any]] = []
         systemic_probe_failure = ""
         should_fast_connect = (
             ui_cfg.get("connection_enabled", True)
@@ -2759,66 +2775,91 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     auto_switch_node()
                     if active_openvpn_running():
                         valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
-                        message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected."
+                        message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected; continuing fair discovery."
                         set_state(
                             last_check_at=time.time(),
                             last_check_message=message,
                             active_openvpn_node_id=active_openvpn_node_id,
                             valid_nodes=valid_nodes_count,
                         )
-                        return message
                     is_connecting = True
 
-        if active_openvpn_running() and history_node_ids and not systemic_probe_failure:
-            history_retest_ids = history_node_ids[:HISTORY_RETEST_PER_CYCLE]
-            if history_retest_ids:
-                msg = f"历史节点循环复测：本轮检测 {len(history_retest_ids)} 个到期旧节点"
-                print(f"[历史节点库] {msg}", flush=True)
+        tested_results: list[dict[str, Any]] = []
+        if systemic_probe_failure:
+            msg = f"已跳过本轮公平扩库检测，系统级故障需要先处理: {systemic_probe_failure}"
+            print(f"[周期检测] {msg}", flush=True)
+            log_to_json("ERROR", "VPN", msg)
+            set_state(last_check_message=msg)
+        else:
+            queue_quotas = {
+                "untested": DISCOVERY_UNTESTED_PER_CYCLE,
+                "known_good": HISTORY_SUCCESS_RETEST_PER_CYCLE,
+                "retry": HISTORY_FAILED_RETEST_PER_CYCLE,
+            }
+            with lock:
+                current_nodes = read_nodes()
+                current_by_id = {
+                    str(node.get("id") or ""): node
+                    for node in current_nodes
+                    if node.get("id")
+                }
+                to_test_ids: list[str] = []
+                queued_ids: set[str] = set(initial_tested_ids)
+                if active_openvpn_node_id:
+                    queued_ids.add(str(active_openvpn_node_id))
+                queue_counts = {name: 0 for name in queue_quotas}
+                for queue_name in ("untested", "known_good", "retry"):
+                    planned_nodes = [
+                        current_by_id.get(str(candidate.get("id") or ""))
+                        for candidate in probe_plan_candidates
+                        if candidate.get("probe_queue") == queue_name
+                    ]
+                    planned_nodes = [
+                        node
+                        for node in planned_nodes
+                        if node and str(node.get("id") or "") not in queued_ids
+                    ]
+                    planned_nodes = apply_routing_filters(
+                        planned_nodes,
+                        ui_cfg,
+                        include_unknown_ip_type=True,
+                    )
+                    for node in planned_nodes:
+                        node_id = str(node.get("id") or "")
+                        if not node_id or node_id in queued_ids:
+                            continue
+                        to_test_ids.append(node_id)
+                        queued_ids.add(node_id)
+                        queue_counts[queue_name] += 1
+                        if queue_counts[queue_name] >= queue_quotas[queue_name]:
+                            break
+
+            if to_test_ids:
+                msg = (
+                    "公平扩库检测："
+                    f"首次检测 {queue_counts['untested']} 个，"
+                    f"成功节点复测 {queue_counts['known_good']} 个，"
+                    f"失败节点重试 {queue_counts['retry']} 个"
+                )
+                print(f"[公平检测] {msg}", flush=True)
+                log_to_json("INFO", "Main", msg)
                 set_state(is_connecting=True, last_check_message=msg)
-                history_tested_results = test_multiple_nodes(history_retest_ids, target_available=None)
+                tested_results = test_multiple_nodes(to_test_ids, target_available=None)
                 initial_tested_ids.update(
                     str(result.get("id") or "")
-                    for result in history_tested_results
+                    for result in tested_results
                     if result.get("id")
                 )
                 systemic_probe_failure = next(
                     (
                         str(result.get("probe_message") or "")
-                        for result in history_tested_results
+                        for result in tested_results
                         if is_systemic_probe_failure(result.get("probe_message"))
                     ),
                     "",
                 )
-
-        tested_results: list[dict[str, Any]] = []
-        if systemic_probe_failure:
-            msg = f"已跳过本轮剩余节点检测，系统级故障需要先处理: {systemic_probe_failure}"
-            print(f"[周期检测] {msg}", flush=True)
-            log_to_json("ERROR", "VPN", msg)
-            set_state(last_check_message=msg)
-        else:
-            # Test remaining non-active nodes from the list
-            with lock:
-                current_nodes = read_nodes()
-                to_test = [
-                    n for n in current_nodes
-                    if not n.get("active") and n.get("id") not in initial_tested_ids
-                ]
-                to_test = apply_routing_filters(to_test, ui_cfg, include_unknown_ip_type=True)
-                to_test.sort(
-                    key=lambda node: (
-                        1 if node.get("history_only") else 0,
-                        probe_priority_key(node),
-                    )
-                )
-                to_test_ids = [n["id"] for n in to_test]
-
-            msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
-            print(f"[周期检测] {msg}", flush=True)
-            log_to_json("INFO", "Main", msg)
-
-            set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
-            tested_results = test_multiple_nodes(to_test_ids, target_available=TARGET_VALID_NODES)
+            else:
+                set_state(last_check_message="本轮没有到期的公平扩库检测任务")
         is_connecting = False
         
         with lock:
@@ -2857,7 +2898,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-        total_tested = len(fast_results) + len(history_tested_results) + len(tested_results)
+        total_tested = len(fast_results) + len(tested_results)
         protected_history_ids = set(ui_cfg.get("favorite_node_ids", []) if isinstance(ui_cfg.get("favorite_node_ids"), list) else [])
         if active_openvpn_node_id:
             protected_history_ids.add(str(active_openvpn_node_id))
@@ -2871,8 +2912,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
             print(f"[历史节点库] 清理任务失败，已跳过: {exc}", flush=True)
         history_stats = history_database_stats()
         message = (
-            f"Fetched {fresh_candidate_count} fresh nodes and restored {len(history_candidates)} history nodes. "
-            f"Tested {total_tested} prioritized non-active nodes."
+            f"Fetched {fresh_candidate_count} fresh nodes and restored {len(restored_history_candidates)} history nodes. "
+            f"Tested {total_tested} non-active nodes via the fair scheduler."
         )
         set_state(
             last_check_at=time.time(),
@@ -4670,7 +4711,7 @@ INDEX_HTML = r"""<!doctype html>
     <!-- 分页控制栏 -->
     <div id="pagination_container" class="pagination-container" style="padding: 16px; display: none; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
+        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条；当前工作列表 <span id="workset_count" style="color: var(--text-primary); font-weight:600;">0</span> 条（可用 <span id="workset_available">0</span> / 不可用 <span id="workset_unavailable">0</span> / 待检测 <span id="workset_pending">0</span>），当前筛选 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条
       </div>
       <div style="display: flex; gap: 8px; align-items: center;">
         <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
@@ -5510,7 +5551,7 @@ function render(){
   if ($("active")) $("active").textContent = activeNode ? 1 : 0; 
   
   const statusMessage = state.last_check_message || "";
-  const historyInfo = `历史 IP：${Number(state.history_unique_ips || 0)} · 曾可用：${Number(state.history_ever_available || 0)} · 待复测：${Number(state.history_due || 0)}`;
+  const historyInfo = `历史唯一IP：${Number(state.history_unique_ips || 0)} · 当前确认可用IP：${Number(state.history_available_unique_ips || 0)} · 首次待检测：${Number(state.history_untested_due || 0)} · 历史待复测：${Number(state.history_retest_due || 0)} · 失败冷却中：${Number(state.history_failure_cooldown || 0)}`;
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
   if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | ${esc(historyInfo)} | 状态：${esc(statusMessage)}`; }
@@ -5569,7 +5610,7 @@ function render(){
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
   const paginationContainer = $("pagination_container");
-  if (paginationContainer) paginationContainer.style.display = totalPages > 1 ? "flex" : "none";
+  if (paginationContainer) paginationContainer.style.display = (nodes.length || shown.length) ? "flex" : "none";
   if (currentPage > totalPages) currentPage = totalPages;
   if (currentPage < 1) currentPage = 1;
   
@@ -5641,8 +5682,22 @@ function render(){
   setHtmlIfChanged($("rows"), rowsHtml);
 
   // Render pagination controls
+  const worksetNodes = Array.from(new Map(
+    nodes.filter(node => node && node.id).map(node => [String(node.id), node])
+  ).values());
+  const worksetAvailable = worksetNodes.filter(
+    node => node.active || node.probe_status === "available"
+  ).length;
+  const worksetUnavailable = worksetNodes.filter(
+    node => ["unavailable", "invalid_config"].includes(node.probe_status)
+  ).length;
+  const worksetPending = Math.max(0, worksetNodes.length - worksetAvailable - worksetUnavailable);
   $("page_start").textContent = shown.length > 0 ? startIndex + 1 : 0;
   $("page_end").textContent = endIndex;
+  $("workset_count").textContent = worksetNodes.length;
+  $("workset_available").textContent = worksetAvailable;
+  $("workset_unavailable").textContent = worksetUnavailable;
+  $("workset_pending").textContent = worksetPending;
   $("filtered_count").textContent = shown.length;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
@@ -6661,16 +6716,19 @@ load().catch(error => console.error("初始化节点数据失败", error));
 // 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
 let backgroundPollInFlight = false;
 setInterval(async () => {
-  if (backgroundPollInFlight || !isPageVisible()) return;
-  if (typeof state !== "undefined" && !state.is_connecting && !state.maintenance_running && (!testingNodeIds || !testingNodeIds.size)) {
-    backgroundPollInFlight = true;
-    try {
-      const data = await fetchNodesSnapshot();
-      applyNodesSnapshot(data);
-    } catch(e) {
-    } finally {
-      backgroundPollInFlight = false;
-    }
+  if (
+    backgroundPollInFlight
+    || !isPageVisible()
+    || batchTest.running
+    || (testingNodeIds && testingNodeIds.size)
+  ) return;
+  backgroundPollInFlight = true;
+  try {
+    const data = await fetchNodesSnapshot();
+    applyNodesSnapshot(data);
+  } catch(e) {
+  } finally {
+    backgroundPollInFlight = false;
   }
 }, 10000);
 let gatewayPollInterval = null;

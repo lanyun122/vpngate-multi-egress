@@ -13,7 +13,7 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
 RETRY_DELAYS_SECONDS = (15 * 60, 60 * 60, 6 * 60 * 60, 24 * 60 * 60, 3 * 24 * 60 * 60, 7 * 24 * 60 * 60)
-SUCCESS_RECHECK_SECONDS = 6 * 60 * 60
+SUCCESS_RECHECK_SECONDS = 24 * 60 * 60
 _write_lock = threading.RLock()
 
 _SCHEMA = """
@@ -375,6 +375,149 @@ def select_workset(
     return selected
 
 
+def select_probe_plan(
+    db_path: str | Path,
+    *,
+    untested_limit: int = 10,
+    known_good_limit: int = 5,
+    retry_limit: int = 5,
+    country_codes: Iterable[str] | None = None,
+    favorite_node_ids: Iterable[str] | None = None,
+    exclude_endpoint_keys: Iterable[str] | None = None,
+    exclude_node_ids: Iterable[str] | None = None,
+    include_current: bool = True,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
+    """Build a fair, bounded probe plan without allowing one class to starve another."""
+    initialize(db_path)
+    timestamp = _now(now)
+    limits = {
+        "untested": max(0, int(untested_limit)),
+        "known_good": max(0, int(known_good_limit)),
+        "retry": max(0, int(retry_limit)),
+    }
+    if not any(limits.values()):
+        return []
+
+    countries = {str(code).strip().upper() for code in (country_codes or []) if str(code).strip()}
+    favorites = {str(value) for value in (favorite_node_ids or []) if str(value)}
+    excluded_keys = {str(value) for value in (exclude_endpoint_keys or []) if str(value)}
+    excluded_ids = {str(value) for value in (exclude_node_ids or []) if str(value)}
+
+    base_where = ["archived = 0", "next_probe_at <= ?"]
+    base_params: list[Any] = [timestamp]
+    if not include_current:
+        base_where.append("in_current_pool = 0")
+    if countries:
+        country_values = sorted(countries)
+        placeholders = ",".join("?" for _ in country_values)
+        base_where.append(f"UPPER(country_short) IN ({placeholders})")
+        base_params.extend(country_values)
+
+    order_parts: list[str] = [
+        "next_probe_at ASC",
+        "last_probe_at ASC",
+        "first_seen_at ASC",
+    ]
+    order_params: list[Any] = []
+    if favorites:
+        favorite_values = sorted(favorites)
+        placeholders = ",".join("?" for _ in favorite_values)
+        order_parts.append(f"CASE WHEN node_id IN ({placeholders}) THEN 0 ELSE 1 END")
+        order_params.extend(favorite_values)
+    order_parts.append("endpoint_key ASC")
+
+    bucket_conditions = {
+        "untested": "last_probe_status = 'not_checked' AND consecutive_failures = 0",
+        "known_good": (
+            "last_probe_status = 'available' AND consecutive_failures = 0 "
+            "AND (probe_success_count + connect_success_count) > 0"
+        ),
+        "retry": "consecutive_failures > 0",
+    }
+    bucket_messages = {
+        "untested": "首次待检测",
+        "known_good": "历史成功节点到期复测",
+        "retry": "失败节点到期重试",
+    }
+
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[str] = set()
+    selected_ids: set[str] = set()
+    with _database(db_path) as connection:
+        for bucket_name in ("untested", "known_good", "retry"):
+            requested_limit = limits[bucket_name]
+            if requested_limit <= 0:
+                continue
+            page_size = max(100, min(500, requested_limit * 5))
+            offset = 0
+            bucket_count = 0
+            query = f"""
+                SELECT *
+                FROM node_history
+                WHERE {' AND '.join(base_where)}
+                  AND {bucket_conditions[bucket_name]}
+                ORDER BY {', '.join(order_parts)}
+                LIMIT ? OFFSET ?
+            """
+            while bucket_count < requested_limit:
+                rows = connection.execute(
+                    query,
+                    (*base_params, *order_params, page_size, offset),
+                ).fetchall()
+                if not rows:
+                    break
+                offset += len(rows)
+                for row in rows:
+                    endpoint = str(row["endpoint_key"])
+                    node_id = str(row["node_id"])
+                    if (
+                        endpoint in excluded_keys
+                        or node_id in excluded_ids
+                        or endpoint in selected_keys
+                        or node_id in selected_ids
+                    ):
+                        continue
+                    try:
+                        node = json.loads(row["node_json"] or "{}")
+                    except json.JSONDecodeError:
+                        node = {}
+                    if not isinstance(node, dict):
+                        node = {}
+                    node.update(
+                        {
+                            "id": node_id,
+                            "ip": row["ip"],
+                            "remote_host": row["remote_host"],
+                            "remote_port": row["remote_port"],
+                            "proto": row["proto"],
+                            "country": row["country"],
+                            "country_short": row["country_short"],
+                            "score": row["source_score"],
+                            "config_text": row["config_text"],
+                            "active": False,
+                            "probe_status": "not_checked",
+                            "probe_message": bucket_messages[bucket_name],
+                            "probed_at": 0,
+                            "history_only": not bool(row["in_current_pool"]),
+                            "history_status": bucket_messages[bucket_name],
+                            "history_force_probe": True,
+                            "history_endpoint_key": endpoint,
+                            "probe_queue": bucket_name,
+                            "probe_due_at": float(row["next_probe_at"] or 0),
+                        }
+                    )
+                    selected.append(node)
+                    selected_keys.add(endpoint)
+                    selected_ids.add(node_id)
+                    bucket_count += 1
+                    if bucket_count >= requested_limit:
+                        break
+                if len(rows) < page_size:
+                    break
+    return selected
+
+
 def archive_node(
     db_path: str | Path,
     node_id: str,
@@ -490,11 +633,12 @@ def record_connection_result(
                     """
                     UPDATE node_history
                     SET connect_failure_count = connect_failure_count + 1,
-                        last_connect_at = ?, last_probe_message = ?,
+                        last_connect_at = ?, last_probe_at = ?,
+                        last_probe_status = 'unavailable', last_probe_message = ?,
                         consecutive_failures = ?, next_probe_at = ?, updated_at = ?
                     WHERE node_id = ?
                     """,
-                    (timestamp, str(message or ""), streak, timestamp + delay, timestamp, str(node_id)),
+                    (timestamp, timestamp, str(message or ""), streak, timestamp + delay, timestamp, str(node_id)),
                 )
     return True
 
@@ -515,10 +659,37 @@ def statistics(db_path: str | Path, now: float | None = None) -> dict[str, int]:
                 SUM(CASE WHEN in_current_pool = 1 AND archived = 0 THEN 1 ELSE 0 END) AS current_count,
                 SUM(CASE WHEN probe_success_count > 0 OR connect_success_count > 0 THEN 1 ELSE 0 END) AS ever_available,
                 SUM(CASE WHEN archived = 0 AND next_probe_at <= ? THEN 1 ELSE 0 END) AS due_count,
-                SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) AS archived_count
+                SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) AS archived_count,
+                COUNT(DISTINCT CASE
+                    WHEN archived = 0
+                     AND last_probe_status = 'available'
+                     AND consecutive_failures = 0
+                     AND next_probe_at > ?
+                    THEN CASE
+                        WHEN ip <> '' THEN ip
+                        WHEN remote_host <> '' THEN remote_host
+                        ELSE endpoint_key
+                    END
+                END) AS available_unique_ips,
+                SUM(CASE
+                    WHEN archived = 0 AND next_probe_at <= ?
+                     AND last_probe_status = 'not_checked'
+                     AND consecutive_failures = 0
+                    THEN 1 ELSE 0
+                END) AS untested_due,
+                SUM(CASE
+                    WHEN archived = 0 AND next_probe_at <= ?
+                     AND last_probe_status <> 'not_checked'
+                    THEN 1 ELSE 0
+                END) AS retest_due,
+                SUM(CASE
+                    WHEN archived = 0 AND consecutive_failures > 0
+                     AND next_probe_at > ?
+                    THEN 1 ELSE 0
+                END) AS failure_cooldown
             FROM node_history
             """,
-            (timestamp,),
+            (timestamp, timestamp, timestamp, timestamp, timestamp),
         ).fetchone()
     return {
         "history_endpoints": int(row["endpoints"] or 0),
@@ -527,6 +698,10 @@ def statistics(db_path: str | Path, now: float | None = None) -> dict[str, int]:
         "history_ever_available": int(row["ever_available"] or 0),
         "history_due": int(row["due_count"] or 0),
         "history_archived": int(row["archived_count"] or 0),
+        "history_available_unique_ips": int(row["available_unique_ips"] or 0),
+        "history_untested_due": int(row["untested_due"] or 0),
+        "history_retest_due": int(row["retest_due"] or 0),
+        "history_failure_cooldown": int(row["failure_cooldown"] or 0),
     }
 
 

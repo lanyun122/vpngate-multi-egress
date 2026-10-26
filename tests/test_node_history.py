@@ -198,7 +198,7 @@ class NodeHistoryTests(unittest.TestCase):
         )
         node_history.sync_snapshot(self.db_path, [current], now=100)
 
-        # A successful node is normally not due again for six hours. Source
+        # A successful node is normally not due again for one day. Source
         # outage recovery must still be able to rebuild from that current pool.
         normal = node_history.select_workset(self.db_path, limit=5, now=101)
         fallback = node_history.select_workset(
@@ -252,6 +252,137 @@ class NodeHistoryTests(unittest.TestCase):
         self.assertEqual("203.0.113.9", row["last_exit_ip"])
         self.assertEqual("available", row["last_probe_status"])
         self.assertEqual(0, row["consecutive_failures"])
+
+    def test_successful_nodes_are_rechecked_after_one_day(self) -> None:
+        self.assertEqual(24 * 60 * 60, node_history.SUCCESS_RECHECK_SECONDS)
+        node_history.sync_snapshot(self.db_path, [make_node("daily", "198.51.100.70")], now=100)
+        node_history.record_probe_results(
+            self.db_path,
+            [{"id": "daily", "probe_status": "available", "probe_message": "ok"}],
+            now=200,
+        )
+        self.assertEqual(200 + 24 * 60 * 60, self.row("daily")["next_probe_at"])
+
+    def test_fair_probe_plan_reserves_all_three_queues(self) -> None:
+        untested = [make_node(f"untested-{index:02d}", f"198.51.1.{index + 1}") for index in range(15)]
+        known_good = [make_node(f"good-{index:02d}", f"198.51.2.{index + 1}") for index in range(8)]
+        retry = [make_node(f"retry-{index:02d}", f"198.51.3.{index + 1}") for index in range(8)]
+        all_nodes = untested + known_good + retry
+        node_history.sync_snapshot(self.db_path, all_nodes, now=100)
+
+        with sqlite3.connect(self.db_path) as connection:
+            for index, node in enumerate(untested):
+                connection.execute(
+                    "UPDATE node_history SET next_probe_at = ?, last_probe_at = 0 WHERE node_id = ?",
+                    (10 + index, node["id"]),
+                )
+            for index, node in enumerate(known_good):
+                connection.execute(
+                    """
+                    UPDATE node_history
+                    SET last_probe_status = 'available', probe_success_count = 1,
+                        consecutive_failures = 0, last_probe_at = ?, next_probe_at = ?
+                    WHERE node_id = ?
+                    """,
+                    (20 + index, 30 + index, node["id"]),
+                )
+            for index, node in enumerate(retry):
+                connection.execute(
+                    """
+                    UPDATE node_history
+                    SET last_probe_status = 'unavailable', probe_failure_count = 1,
+                        consecutive_failures = 1, last_probe_at = ?, next_probe_at = ?
+                    WHERE node_id = ?
+                    """,
+                    (40 + index, 50 + index, node["id"]),
+                )
+            connection.commit()
+
+        plan = node_history.select_probe_plan(
+            self.db_path,
+            untested_limit=10,
+            known_good_limit=5,
+            retry_limit=5,
+            now=1_000,
+        )
+        buckets = {
+            name: [node["id"] for node in plan if node["probe_queue"] == name]
+            for name in ("untested", "known_good", "retry")
+        }
+
+        self.assertEqual([node["id"] for node in untested[:10]], buckets["untested"])
+        self.assertEqual([node["id"] for node in known_good[:5]], buckets["known_good"])
+        self.assertEqual([node["id"] for node in retry[:5]], buckets["retry"])
+        self.assertEqual(20, len({node["id"] for node in plan}))
+
+    def test_history_statistics_have_unambiguous_queue_counts(self) -> None:
+        available_a = make_node("available-a", "198.51.100.80", port=443)
+        available_b = make_node("available-b", "198.51.100.80", port=8443)
+        untested = make_node("untested", "198.51.100.81")
+        retry_due = make_node("retry-due", "198.51.100.82")
+        retry_cooldown = make_node("retry-cooldown", "198.51.100.83")
+        node_history.sync_snapshot(
+            self.db_path,
+            [available_a, available_b, untested, retry_due, retry_cooldown],
+            now=100,
+        )
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE node_history
+                SET last_probe_status = 'available', probe_success_count = 1,
+                    consecutive_failures = 0, next_probe_at = 200
+                WHERE node_id IN ('available-a', 'available-b')
+                """
+            )
+            connection.execute(
+                "UPDATE node_history SET next_probe_at = 50 WHERE node_id = 'untested'"
+            )
+            connection.execute(
+                """
+                UPDATE node_history
+                SET last_probe_status = 'unavailable', probe_failure_count = 1,
+                    consecutive_failures = 1, next_probe_at = 50
+                WHERE node_id = 'retry-due'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE node_history
+                SET last_probe_status = 'unavailable', probe_failure_count = 1,
+                    consecutive_failures = 1, next_probe_at = 200
+                WHERE node_id = 'retry-cooldown'
+                """
+            )
+            connection.commit()
+
+        stats = node_history.statistics(self.db_path, now=100)
+        self.assertEqual(1, stats["history_available_unique_ips"])
+        self.assertEqual(1, stats["history_untested_due"])
+        self.assertEqual(1, stats["history_retest_due"])
+        self.assertEqual(1, stats["history_failure_cooldown"])
+
+    def test_connection_failure_clears_confirmed_available_state(self) -> None:
+        node_history.sync_snapshot(self.db_path, [make_node("node-a", "198.51.100.90")], now=100)
+        node_history.record_probe_results(
+            self.db_path,
+            [{"id": "node-a", "probe_status": "available", "probe_message": "ok"}],
+            now=200,
+        )
+
+        node_history.record_connection_result(
+            self.db_path,
+            "node-a",
+            success=False,
+            message="handshake failed",
+            now=300,
+        )
+
+        row = self.row("node-a")
+        self.assertEqual("unavailable", row["last_probe_status"])
+        self.assertEqual(300, row["last_probe_at"])
+        self.assertEqual(1, row["consecutive_failures"])
 
     def test_cleanup_never_deletes_successful_or_protected_nodes(self) -> None:
         old = 100.0

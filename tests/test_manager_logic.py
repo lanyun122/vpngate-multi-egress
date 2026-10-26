@@ -163,6 +163,73 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(5, sum(node.get("probe_status") == "available" for node in stored))
         self.assertEqual(7, sum(node.get("probe_status") == "not_checked" for node in stored))
 
+    def test_probe_uses_configured_timeout_for_manual_and_batch_checks(self) -> None:
+        nodes = self.write_nodes(1)
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(
+                manager,
+                "run_openvpn_until_ready",
+                return_value=(True, "ready", None),
+            ) as openvpn_mock,
+            mock.patch.object(manager, "OPENVPN_TEST_TIMEOUT_SECONDS", 27),
+        ):
+            manager.test_node_by_id(nodes[0]["id"])
+            manager.test_multiple_nodes([nodes[0]["id"]], target_available=None)
+
+        self.assertEqual(2, openvpn_mock.call_count)
+        self.assertTrue(all(call.kwargs["timeout"] == 27 for call in openvpn_mock.call_args_list))
+
+    def test_maintenance_executes_all_fair_queue_quotas(self) -> None:
+        nodes = self.write_nodes(30)
+        nodes[0]["active"] = True
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager.active_openvpn_process = FakeProcess()
+        manager.active_openvpn_node_id = nodes[0]["id"]
+
+        plan = []
+        queue_ranges = {
+            "untested": range(1, 11),
+            "known_good": range(11, 16),
+            "retry": range(16, 21),
+        }
+        for queue_name, indexes in queue_ranges.items():
+            for index in indexes:
+                planned = dict(nodes[index])
+                planned["probe_queue"] = queue_name
+                planned["history_force_probe"] = True
+                plan.append(planned)
+
+        def fake_test(node_ids, target_available=None):
+            self.assertIsNone(target_available)
+            return [
+                {
+                    "id": node_id,
+                    "probe_status": "available",
+                    "probe_message": "ok",
+                    "latency_ms": 10,
+                }
+                for node_id in node_ids
+            ]
+
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=[dict(node) for node in nodes]),
+            mock.patch.object(manager, "load_history_workset", return_value=plan),
+            mock.patch.object(manager, "test_multiple_nodes", side_effect=fake_test) as test_mock,
+            mock.patch.object(manager.node_history, "cleanup"),
+            mock.patch.object(manager, "history_database_stats", return_value={}),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            result = manager.maintain_valid_nodes()
+
+        self.assertEqual(1, test_mock.call_count)
+        planned_ids = test_mock.call_args.args[0]
+        self.assertEqual(20, len(planned_ids))
+        self.assertEqual(20, len(set(planned_ids)))
+        self.assertIn("Tested 20", result)
+
     def test_ip_classification_separates_proxy_use_from_network_type(self) -> None:
         residential, residential_reason = manager.vpn_utils.classify_ip_type(
             {
@@ -897,7 +964,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("@media (prefers-reduced-motion: reduce)", manager.INDEX_HTML)
         self.assertIn("const pageSize = 50;", manager.INDEX_HTML)
         self.assertIn('id="pagination_container"', manager.INDEX_HTML)
-        self.assertIn('paginationContainer.style.display = totalPages > 1 ? "flex" : "none";', manager.INDEX_HTML)
+        self.assertIn('paginationContainer.style.display = (nodes.length || shown.length) ? "flex" : "none";', manager.INDEX_HTML)
         self.assertIn("const MAX_RENDERED_LOG_LINES = 300;", manager.INDEX_HTML)
         self.assertIn("nodesRequestPromise", manager.INDEX_HTML)
         self.assertIn("backgroundPollInFlight", manager.INDEX_HTML)
@@ -932,6 +999,35 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertNotIn('id="status" class="status" style="display: none;"', manager.INDEX_HTML)
         self.assertIn('${esc(localProxy)}', manager.INDEX_HTML)
         self.assertIn('${esc(statusMessage)}', manager.INDEX_HTML)
+
+    def test_dashboard_exposes_unambiguous_history_and_workset_counts(self) -> None:
+        for label in (
+            "历史唯一IP",
+            "当前确认可用IP",
+            "首次待检测",
+            "历史待复测",
+            "失败冷却中",
+            "当前工作列表",
+        ):
+            self.assertIn(label, manager.INDEX_HTML)
+        for element_id in (
+            "workset_count",
+            "workset_available",
+            "workset_unavailable",
+            "workset_pending",
+            "filtered_count",
+        ):
+            self.assertIn(f'id="{element_id}"', manager.INDEX_HTML)
+        self.assertNotIn("条备选节点", manager.INDEX_HTML)
+
+    def test_dashboard_background_poll_recovers_after_server_busy_state(self) -> None:
+        self.assertNotIn(
+            "!state.is_connecting && !state.maintenance_running",
+            manager.INDEX_HTML,
+        )
+        self.assertIn("backgroundPollInFlight", manager.INDEX_HTML)
+        self.assertIn("batchTest.running", manager.INDEX_HTML)
+        self.assertIn("testingNodeIds && testingNodeIds.size", manager.INDEX_HTML)
 
     def test_dashboard_javascript_is_valid(self) -> None:
         if not shutil.which("node"):
