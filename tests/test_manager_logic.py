@@ -1021,13 +1021,14 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertNotIn("条备选节点", manager.INDEX_HTML)
 
     def test_dashboard_background_poll_recovers_after_server_busy_state(self) -> None:
-        self.assertNotIn(
-            "!state.is_connecting && !state.maintenance_running",
-            manager.INDEX_HTML,
-        )
-        self.assertIn("backgroundPollInFlight", manager.INDEX_HTML)
-        self.assertIn("batchTest.running", manager.INDEX_HTML)
-        self.assertIn("testingNodeIds && testingNodeIds.size", manager.INDEX_HTML)
+        poll_start = manager.INDEX_HTML.index("let backgroundPollInFlight")
+        poll_end = manager.INDEX_HTML.index("let gatewayPollInterval", poll_start)
+        poll_block = manager.INDEX_HTML[poll_start:poll_end]
+        self.assertNotIn("state.is_connecting", poll_block)
+        self.assertNotIn("state.maintenance_running", poll_block)
+        self.assertIn("backgroundPollInFlight", poll_block)
+        self.assertIn("batchTest.running", poll_block)
+        self.assertIn("testingNodeIds && testingNodeIds.size", poll_block)
 
     def test_dashboard_javascript_is_valid(self) -> None:
         if not shutil.which("node"):
