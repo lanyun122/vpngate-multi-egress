@@ -13,7 +13,7 @@
 [快速安装](#quick-install) · [完整安装](#installation) · [连接使用](#connection) · [服务商推荐](#vps) · [社区入口](#community) · [法律声明](#legal)
 
 [![项目网站](https://img.shields.io/badge/项目网站-339936.xyz-f97316?style=for-the-badge)](https://339936.xyz)
-[![Telegram](https://img.shields.io/badge/Telegram-交流群-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/arestemple)
+[![Telegram](https://img.shields.io/badge/Telegram-交流群-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://telegram.me/+BwyeTrhg9NQ5MjVl)
 [![YouTube](https://img.shields.io/badge/YouTube-视频教程-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=s-ATfXR8BpI)
 
 </div>
@@ -28,8 +28,8 @@
 
 | 商家 | 推荐理由 | 入口 |
 | :--- | :--- | :---: |
-| <table><tr><td bgcolor="#0969da"><b><font color="#ffffff">Bandwagon</font></b></td></tr></table> | <sub>代理 & 建站推荐：CN2/9929/CMI三网直连 2500 Mbps 高速线路；低延迟、高稳定性，适合直播、带货和长期出海业务。</sub> | [立即查看](https://bandwagonhost.com/aff.php?aff=81790) |
-| <table><tr><td bgcolor="#bf8700"><b><font color="#ffffff">RackNerd</font></b></td></tr></table> | <sub>综合服务器推荐：4000GB 大流量，价格与配置性价比突出；部署成本低，适合需要长期稳定运行的服务。</sub> | [立即查看](https://my.racknerd.com/aff.php?aff=18708) |
+| <table><tr><td bgcolor="#0969da"><b><font color="#ffffff">Bandwagon</font></b></td></tr></table> | <sub>代理 & 建站推荐：CN2/9929/CMI三网直连 2500 Mbps 高速线路；低延迟、高稳定性，适合直播、带货和长期出海业务。</sub> | [立即查看](https://bandwagonhost.com/aff.php?aff=82013&pid=87) |
+| <table><tr><td bgcolor="#bf8700"><b><font color="#ffffff">RackNerd</font></b></td></tr></table> | <sub>综合服务器推荐：4000GB 大流量，价格与配置性价比突出；部署成本低，适合需要长期稳定运行的服务。</sub> | [立即查看](https://my.racknerd.com/aff.php?aff=21691&pid=952) |
 | <table><tr><td bgcolor="#8250df"><b><font color="#ffffff">OpenMili</font></b></td></tr></table> | <sub>OpenMili Ai 中转站推荐：GPT-6 Astra & Images 2.0 Pro 美区原价 0.12倍率 不掺假、不降智，接受任何压力测试！</sub> | [立即查看](https://openmili.com/) |
 | <table><tr><td bgcolor="#bc4c00"><b><font color="#ffffff">IPFLY</font></b></td></tr></table> | <sub>代理服务推荐： 全球200多个国家和地区覆盖，9000万+住宅 IP 资源，稳定安全、可靠连接，适合跨境电商、社媒运营、数据采集等业务；新用户注册专享 7 折优惠，低成本开启全球业务！</sub> | [立即查看](https://console.ipfly.net/register?ad_source=yt_xbjyz) |
 | <table><tr><td bgcolor="#cf222e"><b><font color="#ffffff">JTTI VPS</font></b></td></tr></table> | <sub>稳定建站服务器推荐：5 Mbps 独享带宽 无限流量 CN2/9929/CMI三网直连，跨境网站访问低延迟，长期稳定API运营。</sub> | [立即查看](https://www.jtti.cc/zh/activity/y2026-national-day.html?k=baoweise) |
@@ -249,7 +249,7 @@ ssh -N \
 | 入口 | 用途 | 链接 |
 | --- | --- | --- |
 | 项目网站 / 交流论坛 | 公告、经验交流与讨论 | [339936.xyz](https://339936.xyz) |
-| Telegram 群 | 即时交流 | [t.me/arestemple](https://t.me/arestemple) |
+| Telegram 群 | 即时交流 | [telegram.me/+BwyeTrhg9NQ5MjVl](https://telegram.me/+BwyeTrhg9NQ5MjVl) |
 | YouTube 教程 | 安装和使用视频 | [观看视频](https://www.youtube.com/watch?v=s-ATfXR8BpI) |
 | GitHub Issues | 可复现的问题与功能建议 | [提交 Issue](https://github.com/baoweise-bot/aimili-vpngate/issues) |
 
