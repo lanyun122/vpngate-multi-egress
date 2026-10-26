@@ -61,6 +61,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 import vpn_utils
 import proxy_server
 import snapshot_utils
+import node_history
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -120,6 +121,12 @@ OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
+HISTORY_WORKSET_LIMIT = env_int("HISTORY_WORKSET_LIMIT", 25, 0, 100)
+HISTORY_RETEST_PER_CYCLE = env_int("HISTORY_RETEST_PER_CYCLE", 5, 0, 20)
+DISCOVERY_UNTESTED_PER_CYCLE = env_int("DISCOVERY_UNTESTED_PER_CYCLE", 10, 0, 50)
+HISTORY_SUCCESS_RETEST_PER_CYCLE = env_int("HISTORY_SUCCESS_RETEST_PER_CYCLE", 5, 0, 20)
+HISTORY_FAILED_RETEST_PER_CYCLE = env_int("HISTORY_FAILED_RETEST_PER_CYCLE", 5, 0, 20)
+HISTORY_MAX_ROWS = env_int("HISTORY_MAX_ROWS", 10000, 100, 100000)
 PROXY_FAILURE_THRESHOLD = env_int("PROXY_FAILURE_THRESHOLD", 3, 1, 10)
 SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 180, 0, 3600)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
@@ -147,7 +154,7 @@ try:
 except OSError:
     _version_text = DEFAULT_APP_VERSION
 APP_VERSION = _version_text if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", _version_text) else DEFAULT_APP_VERSION
-APP_VERSION_LABEL = f"V{APP_VERSION} 正式版"
+APP_VERSION_LABEL = f"V{APP_VERSION} 历史库实验版"
 GITHUB_REPOSITORY = "baoweise-bot/aimili-vpngate"
 GITHUB_REPOSITORY_URL = f"https://github.com/{GITHUB_REPOSITORY}"
 GITHUB_MAIN_BRANCH_URL = f"{GITHUB_REPOSITORY_URL}/tree/main"
@@ -155,6 +162,7 @@ GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/r
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
+HISTORY_DB_FILE = DATA_DIR / "node_history.sqlite3"
 STATE_FILE = DATA_DIR / "state.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 UPSTREAM_PROXY_AUTH_FILE = DATA_DIR / "upstream_proxy_auth.txt"
@@ -491,6 +499,44 @@ def read_nodes() -> list[dict[str, Any]]:
         return []
     return [item for item in raw if isinstance(item, dict)]
 
+def initialize_history_store() -> None:
+    try:
+        node_history.initialize(HISTORY_DB_FILE)
+        node_history.seed_if_empty(HISTORY_DB_FILE, read_nodes())
+    except Exception as exc:
+        print(f"[历史节点库] 初始化失败，已降级为原有 nodes.json 模式: {exc}", flush=True)
+
+def history_database_stats() -> dict[str, int]:
+    defaults = {
+        "history_endpoints": 0,
+        "history_unique_ips": 0,
+        "history_current": 0,
+        "history_ever_available": 0,
+        "history_due": 0,
+        "history_archived": 0,
+        "history_available_unique_ips": 0,
+        "history_untested_due": 0,
+        "history_retest_due": 0,
+        "history_failure_cooldown": 0,
+    }
+    try:
+        defaults.update(node_history.statistics(HISTORY_DB_FILE))
+    except Exception as exc:
+        print(f"[历史节点库] 读取统计失败，已跳过: {exc}", flush=True)
+    return defaults
+
+def record_history_connection(node_id: str, success: bool, exit_ip: str = "", message: str = "") -> None:
+    try:
+        node_history.record_connection_result(
+            HISTORY_DB_FILE,
+            node_id,
+            success=success,
+            exit_ip=exit_ip,
+            message=message,
+        )
+    except Exception as exc:
+        print(f"[历史节点库] 记录连接结果失败，未影响当前连接: {exc}", flush=True)
+
 def get_state() -> dict[str, Any]:
     global active_openvpn_node_id, is_connecting
     state = read_json(STATE_FILE, {})
@@ -516,6 +562,7 @@ def get_state() -> dict[str, Any]:
     state["app_version_label"] = APP_VERSION_LABEL
     state["deployment_mode"] = DEPLOYMENT_MODE
     state["deployment_mode_label"] = DEPLOYMENT_MODE_LABEL
+    state.update(history_database_stats())
     
     # Pre-populate settings inputs in UI
     ui_cfg = load_ui_config()
@@ -1893,7 +1940,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     idx = None
     try:
         idx = get_free_test_index()
-        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=OPENVPN_TEST_TIMEOUT_SECONDS, dev=f"tun{idx}")
     finally:
         if idx is not None:
             release_test_index(idx)
@@ -1918,6 +1965,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     if ok:
         vpn_utils.enrich_ip_info([temp_node])
 
+    result: dict[str, Any] = {}
     with lock:
         nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
@@ -1934,10 +1982,10 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
             
             sorted_nodes = sort_all_nodes(nodes)
             write_json(NODES_FILE, sorted_nodes)
-            res = next((item for item in sorted_nodes if item.get("id") == node_id), node)
-            return res
-        else:
-            return {}
+            result = next((item for item in sorted_nodes if item.get("id") == node_id), node)
+
+    record_history_probe_results([result] if result else [])
+    return result
 
 def is_systemic_probe_failure(message: Any) -> bool:
     normalized = str(message or "").lower()
@@ -1947,16 +1995,92 @@ def is_systemic_probe_failure(message: Any) -> bool:
             "err_ovpn_cmd_not_found",
             "err_ovpn_permission_denied",
             "err_ovpn_tun_not_available",
+            "err_ovpn_start_failed",
             "no such file or directory",
             "cannot open tun/tap dev",
             "cannot allocate tun",
         )
     )
 
+def record_history_probe_results(results: list[dict[str, Any]]) -> None:
+    recordable = [
+        result
+        for result in results
+        if result and not is_systemic_probe_failure(result.get("probe_message"))
+    ]
+    if not recordable:
+        return
+    try:
+        node_history.record_probe_results(HISTORY_DB_FILE, recordable)
+    except Exception as exc:
+        print(f"[历史节点库] 记录检测结果失败，未影响 nodes.json: {exc}", flush=True)
+
+def load_history_workset(
+    fresh_candidates: list[dict[str, Any]],
+    ui_cfg: dict[str, Any],
+    *,
+    allow_current: bool = False,
+    exclude_candidates: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return an oversized fair plan; the scheduler applies the per-cycle quotas."""
+    del allow_current
+    try:
+        if fresh_candidates:
+            node_history.sync_snapshot(HISTORY_DB_FILE, fresh_candidates)
+        blacklist_ids = set(load_blacklist().keys())
+        excluded_ids = blacklist_ids | {str(active_openvpn_node_id or "")}
+        favorite_ids = ui_cfg.get("favorite_node_ids", [])
+        if not isinstance(favorite_ids, list):
+            favorite_ids = []
+        plan_nodes = node_history.select_probe_plan(
+            HISTORY_DB_FILE,
+            untested_limit=DISCOVERY_UNTESTED_PER_CYCLE * 2,
+            known_good_limit=HISTORY_SUCCESS_RETEST_PER_CYCLE * 2,
+            retry_limit=HISTORY_FAILED_RETEST_PER_CYCLE * 2,
+            country_codes=normalize_discovery_countries(ui_cfg.get("discovery_countries")),
+            favorite_node_ids=favorite_ids,
+            exclude_node_ids=excluded_ids,
+            include_current=True,
+        )
+        valid_nodes: list[dict[str, Any]] = []
+        for node in plan_nodes:
+            node_id = str(node.get("id") or "").strip()
+            if not node_id:
+                continue
+            try:
+                snapshot_utils.validate_openvpn_config(str(node.get("config_text") or ""))
+            except (TypeError, ValueError) as exc:
+                try:
+                    node_history.archive_node(
+                        HISTORY_DB_FILE,
+                        node_id,
+                        message=f"历史配置无效: {exc}",
+                    )
+                except Exception as archive_exc:
+                    print(f"[历史节点库] 归档无效节点 {node_id} 失败: {archive_exc}", flush=True)
+                continue
+            node["config_file"] = str(CONFIG_DIR / f"{safe_name(node_id)}.ovpn")
+            node["active"] = False
+            node["history_force_probe"] = True
+            valid_nodes.append(node)
+        return valid_nodes
+    except Exception as exc:
+        print(f"[历史节点库] 生成公平检测计划失败，已继续使用本轮新节点: {exc}", flush=True)
+        return []
+
 def test_multiple_nodes(node_ids: list[str], target_available: int | None = None) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
-        to_test = [n for n in nodes if n.get("id") in node_ids]
+        nodes_by_id = {
+            str(node.get("id") or ""): node
+            for node in nodes
+            if node.get("id")
+        }
+        to_test = [
+            nodes_by_id[node_id]
+            for node_id in node_ids
+            if node_id in nodes_by_id
+        ]
         
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
@@ -1984,7 +2108,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         try:
             tun_idx = get_free_test_index()
             dev_name = f"tun{tun_idx}"
-            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
+            ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=OPENVPN_TEST_TIMEOUT_SECONDS, dev=dev_name)
         finally:
             if tun_idx is not None:
                 release_test_index(tun_idx)
@@ -2079,7 +2203,9 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         sorted_nodes = sort_all_nodes(current_nodes)
         write_json(NODES_FILE, sorted_nodes)
         
-    return list(updated_nodes_map.values())
+    recorded_results = list(updated_nodes_map.values())
+    record_history_probe_results(recorded_results)
+    return recorded_results
 
 def cancel_background_refill() -> None:
     background_refill_cancel_event.set()
@@ -2234,6 +2360,7 @@ def connect_node(
         token, cancel_event = reserved_attempt
     stopped_existing = False
     previous_node_id = ""
+    node: dict[str, Any] | None = None
     try:
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
@@ -2311,6 +2438,8 @@ def connect_node(
             write_json(NODES_FILE, sort_all_nodes(nodes))
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
+            if not is_systemic_probe_failure(message):
+                record_history_connection(node_id, False, message=str(message))
             raise RuntimeError(message)
             
         with lock:
@@ -2395,6 +2524,12 @@ def connect_node(
                 f"已安排刷新 {stale_session_count} 个旧代理会话，客户端将自动重连",
             )
         cancel_background_refill()
+        record_history_connection(
+            node_id,
+            True,
+            exit_ip=str(res.get("ip") or ""),
+            message="实际代理出口验证成功",
+        )
         return f"Connected {node_id}"
     except ConnectionCancelled:
         if stopped_existing:
@@ -2454,9 +2589,11 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         auto_switch_node()
                         is_connecting = True
 
+        fetch_succeeded = False
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch_candidates()
+            fetch_succeeded = True
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
             diag_msg = str(exc)
@@ -2466,6 +2603,53 @@ def maintain_valid_nodes(force: bool = False) -> str:
             set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
             candidates = []
 
+        ui_cfg = load_ui_config()
+        fresh_candidates = list(candidates)
+        fresh_candidate_count = len(fresh_candidates)
+        preserved_candidates: list[dict[str, Any]] = []
+        if not fetch_succeeded or not fresh_candidates:
+            with lock:
+                preserved_candidates = [
+                    dict(node)
+                    for node in read_nodes()
+                    if isinstance(node, dict) and node.get("id")
+                ]
+        probe_plan_candidates = load_history_workset(
+            fresh_candidates,
+            ui_cfg,
+            allow_current=not fetch_succeeded or not fresh_candidates,
+            exclude_candidates=preserved_candidates,
+        )
+        probe_plan_by_id = {
+            str(node.get("id") or ""): node
+            for node in probe_plan_candidates
+            if node.get("id")
+        }
+        base_candidates = fresh_candidates + preserved_candidates
+        for candidate in base_candidates:
+            planned = probe_plan_by_id.get(str(candidate.get("id") or ""))
+            if not planned:
+                continue
+            for key in (
+                "probe_queue",
+                "probe_due_at",
+                "history_status",
+                "history_force_probe",
+                "history_endpoint_key",
+            ):
+                if key in planned:
+                    candidate[key] = planned[key]
+        base_ids = {
+            str(node.get("id") or "")
+            for node in base_candidates
+            if node.get("id")
+        }
+        restored_history_candidates = [
+            node
+            for node in probe_plan_candidates
+            if str(node.get("id") or "") not in base_ids
+        ]
+        candidates = base_candidates + restored_history_candidates
         if not candidates:
             return "没有拉取到新节点"
 
@@ -2491,11 +2675,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 if cand["id"] not in seen_ids:
                     previous = current_by_id.get(str(cand["id"]))
                     if previous:
-                        for key in [
-                            "probe_status",
-                            "probe_message",
-                            "latency_ms",
-                            "probed_at",
+                        preserved_fields = [
                             "owner",
                             "asn",
                             "as_name",
@@ -2506,7 +2686,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             "is_hosting",
                             "is_mobile",
                             "ip_type_reason",
-                        ]:
+                        ]
+                        if not cand.get("history_force_probe"):
+                            preserved_fields = [
+                                "probe_status",
+                                "probe_message",
+                                "latency_ms",
+                                "probed_at",
+                            ] + preserved_fields
+                        for key in preserved_fields:
                             if previous.get(key) not in (None, ""):
                                 cand[key] = previous.get(key)
                     merged.append(cand)
@@ -2514,7 +2702,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     
             if len(merged) > 1000:
                 merged = merged[:1000]
-                
+
             for n in merged:
                 config_path = Path(n["config_file"])
                 if not config_path.exists():
@@ -2529,7 +2717,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
         systemic_probe_failure = ""
-        ui_cfg = load_ui_config()
         should_fast_connect = (
             ui_cfg.get("connection_enabled", True)
             and ui_cfg.get("routing_mode", "auto") != "fixed_ip"
@@ -2543,7 +2730,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if not n.get("active") and n.get("probe_status") != "unavailable"
                 ]
                 fast_candidates = apply_routing_filters(fast_candidates, ui_cfg, include_unknown_ip_type=True)
-                fast_candidates.sort(key=probe_priority_key)
+                fast_candidates.sort(
+                    key=lambda node: (
+                        1 if node.get("history_only") else 0,
+                        probe_priority_key(node),
+                    )
+                )
                 fast_test_ids = [
                     n["id"] for n in fast_candidates
                     if n.get("id")
@@ -2583,40 +2775,91 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     auto_switch_node()
                     if active_openvpn_running():
                         valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
-                        message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected."
+                        message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected; continuing fair discovery."
                         set_state(
                             last_check_at=time.time(),
                             last_check_message=message,
                             active_openvpn_node_id=active_openvpn_node_id,
                             valid_nodes=valid_nodes_count,
                         )
-                        return message
                     is_connecting = True
 
         tested_results: list[dict[str, Any]] = []
         if systemic_probe_failure:
-            msg = f"已跳过本轮剩余节点检测，系统级故障需要先处理: {systemic_probe_failure}"
+            msg = f"已跳过本轮公平扩库检测，系统级故障需要先处理: {systemic_probe_failure}"
             print(f"[周期检测] {msg}", flush=True)
             log_to_json("ERROR", "VPN", msg)
             set_state(last_check_message=msg)
         else:
-            # Test remaining non-active nodes from the list
+            queue_quotas = {
+                "untested": DISCOVERY_UNTESTED_PER_CYCLE,
+                "known_good": HISTORY_SUCCESS_RETEST_PER_CYCLE,
+                "retry": HISTORY_FAILED_RETEST_PER_CYCLE,
+            }
             with lock:
                 current_nodes = read_nodes()
-                to_test = [
-                    n for n in current_nodes
-                    if not n.get("active") and n.get("id") not in initial_tested_ids
-                ]
-                to_test = apply_routing_filters(to_test, ui_cfg, include_unknown_ip_type=True)
-                to_test.sort(key=probe_priority_key)
-                to_test_ids = [n["id"] for n in to_test]
+                current_by_id = {
+                    str(node.get("id") or ""): node
+                    for node in current_nodes
+                    if node.get("id")
+                }
+                to_test_ids: list[str] = []
+                queued_ids: set[str] = set(initial_tested_ids)
+                if active_openvpn_node_id:
+                    queued_ids.add(str(active_openvpn_node_id))
+                queue_counts = {name: 0 for name in queue_quotas}
+                for queue_name in ("untested", "known_good", "retry"):
+                    planned_nodes = [
+                        current_by_id.get(str(candidate.get("id") or ""))
+                        for candidate in probe_plan_candidates
+                        if candidate.get("probe_queue") == queue_name
+                    ]
+                    planned_nodes = [
+                        node
+                        for node in planned_nodes
+                        if node and str(node.get("id") or "") not in queued_ids
+                    ]
+                    planned_nodes = apply_routing_filters(
+                        planned_nodes,
+                        ui_cfg,
+                        include_unknown_ip_type=True,
+                    )
+                    for node in planned_nodes:
+                        node_id = str(node.get("id") or "")
+                        if not node_id or node_id in queued_ids:
+                            continue
+                        to_test_ids.append(node_id)
+                        queued_ids.add(node_id)
+                        queue_counts[queue_name] += 1
+                        if queue_counts[queue_name] >= queue_quotas[queue_name]:
+                            break
 
-            msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
-            print(f"[周期检测] {msg}", flush=True)
-            log_to_json("INFO", "Main", msg)
-
-            set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
-            tested_results = test_multiple_nodes(to_test_ids, target_available=TARGET_VALID_NODES)
+            if to_test_ids:
+                msg = (
+                    "公平扩库检测："
+                    f"首次检测 {queue_counts['untested']} 个，"
+                    f"成功节点复测 {queue_counts['known_good']} 个，"
+                    f"失败节点重试 {queue_counts['retry']} 个"
+                )
+                print(f"[公平检测] {msg}", flush=True)
+                log_to_json("INFO", "Main", msg)
+                set_state(is_connecting=True, last_check_message=msg)
+                tested_results = test_multiple_nodes(to_test_ids, target_available=None)
+                initial_tested_ids.update(
+                    str(result.get("id") or "")
+                    for result in tested_results
+                    if result.get("id")
+                )
+                systemic_probe_failure = next(
+                    (
+                        str(result.get("probe_message") or "")
+                        for result in tested_results
+                        if is_systemic_probe_failure(result.get("probe_message"))
+                    ),
+                    "",
+                )
+            else:
+                set_state(last_check_message="本轮没有到期的公平扩库检测任务")
         is_connecting = False
         
         with lock:
@@ -2656,12 +2899,28 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         total_tested = len(fast_results) + len(tested_results)
-        message = f"Fetched {len(candidates)} nodes. Tested {total_tested} prioritized non-active nodes."
+        protected_history_ids = set(ui_cfg.get("favorite_node_ids", []) if isinstance(ui_cfg.get("favorite_node_ids"), list) else [])
+        if active_openvpn_node_id:
+            protected_history_ids.add(str(active_openvpn_node_id))
+        try:
+            node_history.cleanup(
+                HISTORY_DB_FILE,
+                protected_node_ids=protected_history_ids,
+                max_rows=HISTORY_MAX_ROWS,
+            )
+        except Exception as exc:
+            print(f"[历史节点库] 清理任务失败，已跳过: {exc}", flush=True)
+        history_stats = history_database_stats()
+        message = (
+            f"Fetched {fresh_candidate_count} fresh nodes and restored {len(restored_history_candidates)} history nodes. "
+            f"Tested {total_tested} non-active nodes via the fair scheduler."
+        )
         set_state(
             last_check_at=time.time(),
             last_check_message=message,
             active_openvpn_node_id=active_openvpn_node_id,
             valid_nodes=valid_nodes_count,
+            **history_stats,
         )
         return message
     except Exception as e:
@@ -4290,12 +4549,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V2.1.7 正式版</span>
+        <span id="github_version_label">V2.1.7 历史库实验版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V2.1.7 正式版</div>
+          <div id="current_version_label" class="version-current-label">V2.1.7 历史库实验版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -4307,7 +4566,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
       </div>
     </div>
-    <a href="https://t.me/arestemple" target="_blank" rel="noopener noreferrer" class="btn-telegram">
+    <a href="https://telegram.me/+BwyeTrhg9NQ5MjVl" target="_blank" rel="noopener noreferrer" class="btn-telegram">
       <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
       Telegram
     </a>
@@ -4452,7 +4711,7 @@ INDEX_HTML = r"""<!doctype html>
     <!-- 分页控制栏 -->
     <div id="pagination_container" class="pagination-container" style="padding: 16px; display: none; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
+        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条；当前工作列表 <span id="workset_count" style="color: var(--text-primary); font-weight:600;">0</span> 条（可用 <span id="workset_available">0</span> / 不可用 <span id="workset_unavailable">0</span> / 待检测 <span id="workset_pending">0</span>），当前筛选 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条
       </div>
       <div style="display: flex; gap: 8px; align-items: center;">
         <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
@@ -4610,12 +4869,12 @@ INDEX_HTML = r"""<!doctype html>
         <div class="vps-item">
           <span class="vps-tag tag-normal">RNVPS (RackNerd) 推荐</span>
           <span class="vps-desc">超低折扣价格，性价比极高，日常使用实惠方便，海外多机房可选，非常适合普通大众用户。</span>
-          <a href="https://my.racknerd.com/aff.php?aff=18708" target="_blank" rel="noopener noreferrer" class="vps-btn">点击进入官网</a>
+          <a href="https://my.racknerd.com/aff.php?aff=21691&pid=952" target="_blank" rel="noopener noreferrer" class="vps-btn">点击进入官网</a>
         </div>
         <div class="vps-item">
           <span class="vps-tag tag-premium">搬瓦工 (Bandwagon) 推荐</span>
           <span class="vps-desc">直连三网顶级专线，经典高带宽 CN2 GIA/9929 优化线路，极致速度且超凡稳定，高端用户首选。</span>
-          <a href="https://bandwagonhost.com/aff.php?aff=81790" target="_blank" rel="noopener noreferrer" class="vps-btn">点击进入官网</a>
+          <a href="https://bandwagonhost.com/aff.php?aff=82013&pid=87" target="_blank" rel="noopener noreferrer" class="vps-btn">点击进入官网</a>
         </div>
       </div>
       
@@ -5194,7 +5453,7 @@ function renderBatchTestButton() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V2.1.7 正式版";
+  const versionLabel = state.app_version_label || "V2.1.7 历史库实验版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -5292,9 +5551,10 @@ function render(){
   if ($("active")) $("active").textContent = activeNode ? 1 : 0; 
   
   const statusMessage = state.last_check_message || "";
+  const historyInfo = `历史唯一IP：${Number(state.history_unique_ips || 0)} · 当前确认可用IP：${Number(state.history_available_unique_ips || 0)} · 首次待检测：${Number(state.history_untested_due || 0)} · 历史待复测：${Number(state.history_retest_due || 0)} · 失败冷却中：${Number(state.history_failure_cooldown || 0)}`;
   const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
   const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
-  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`; }
+  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | ${esc(historyInfo)} | 状态：${esc(statusMessage)}`; }
   
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
@@ -5350,7 +5610,7 @@ function render(){
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
   const paginationContainer = $("pagination_container");
-  if (paginationContainer) paginationContainer.style.display = totalPages > 1 ? "flex" : "none";
+  if (paginationContainer) paginationContainer.style.display = (nodes.length || shown.length) ? "flex" : "none";
   if (currentPage > totalPages) currentPage = totalPages;
   if (currentPage < 1) currentPage = 1;
   
@@ -5422,8 +5682,22 @@ function render(){
   setHtmlIfChanged($("rows"), rowsHtml);
 
   // Render pagination controls
+  const worksetNodes = Array.from(new Map(
+    nodes.filter(node => node && node.id).map(node => [String(node.id), node])
+  ).values());
+  const worksetAvailable = worksetNodes.filter(
+    node => node.active || node.probe_status === "available"
+  ).length;
+  const worksetUnavailable = worksetNodes.filter(
+    node => ["unavailable", "invalid_config"].includes(node.probe_status)
+  ).length;
+  const worksetPending = Math.max(0, worksetNodes.length - worksetAvailable - worksetUnavailable);
   $("page_start").textContent = shown.length > 0 ? startIndex + 1 : 0;
   $("page_end").textContent = endIndex;
+  $("workset_count").textContent = worksetNodes.length;
+  $("workset_available").textContent = worksetAvailable;
+  $("workset_unavailable").textContent = worksetUnavailable;
+  $("workset_pending").textContent = worksetPending;
   $("filtered_count").textContent = shown.length;
   $("current_page_val").textContent = currentPage;
   $("total_pages_val").textContent = totalPages;
@@ -6442,16 +6716,19 @@ load().catch(error => console.error("初始化节点数据失败", error));
 // 每 10 秒在前台空闲时自动更新节点与状态，无需手动刷新页面
 let backgroundPollInFlight = false;
 setInterval(async () => {
-  if (backgroundPollInFlight || !isPageVisible()) return;
-  if (typeof state !== "undefined" && !state.is_connecting && !state.maintenance_running && (!testingNodeIds || !testingNodeIds.size)) {
-    backgroundPollInFlight = true;
-    try {
-      const data = await fetchNodesSnapshot();
-      applyNodesSnapshot(data);
-    } catch(e) {
-    } finally {
-      backgroundPollInFlight = false;
-    }
+  if (
+    backgroundPollInFlight
+    || !isPageVisible()
+    || batchTest.running
+    || (testingNodeIds && testingNodeIds.size)
+  ) return;
+  backgroundPollInFlight = true;
+  try {
+    const data = await fetchNodesSnapshot();
+    applyNodesSnapshot(data);
+  } catch(e) {
+  } finally {
+    backgroundPollInFlight = false;
   }
 }, 10000);
 let gatewayPollInterval = null;
@@ -7670,6 +7947,7 @@ class Tee:
 
 def main() -> None:
     ensure_dirs()
+    initialize_history_store()
     kill_existing_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"

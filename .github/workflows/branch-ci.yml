@@ -1,0 +1,35 @@
+name: Experiment branch CI
+
+on:
+  push:
+    branches:
+      - feature/node-history-sqlite
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile Python sources
+        run: python -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py node_history.py
+      - name: Validate installer
+        run: bash -n install.sh
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Build release archive smoke test
+        run: python scripts/build_release_archives.py --output-dir "${RUNNER_TEMP}/aimilivpn-dist"
